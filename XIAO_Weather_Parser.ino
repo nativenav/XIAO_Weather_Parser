@@ -26,14 +26,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-
-// =============================================================================
-// CONFIGURATION - UPDATE THESE VALUES
-// =============================================================================
-
-// TODO: Replace with your WiFi credentials
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+#include <Preferences.h>
 
 // =============================================================================
 // GLOBAL VARIABLES
@@ -43,6 +36,15 @@ WiFiState currentWiFiState = WIFI_DISCONNECTED;
 bool debugMode = false;
 String commandBuffer = "";
 WeatherData lastParsedData;
+
+// WiFi Management
+Preferences preferences;
+WiFiCredentials storedCredentials;
+WiFiNetworkInfo scannedNetworks[MAX_WIFI_NETWORKS];
+int numScannedNetworks = 0;
+unsigned long lastWiFiReconnectAttempt = 0;
+bool awaitingPasswordInput = false;
+int selectedNetworkIndex = -1;
 
 // =============================================================================
 // SETUP FUNCTION
@@ -69,8 +71,14 @@ void setup() {
   // Initialize weather data structure
   initializeWeatherData(&lastParsedData);
   
+  // Initialize WiFi management
+  initializeWiFiManagement();
+  
   // Set WiFi mode
   WiFi.mode(WIFI_STA);
+  
+  // Try to auto-connect to stored WiFi credentials
+  autoConnectWiFi();
   
   Serial.println("Ready to parse weather data!");
   Serial.print("> ");
@@ -128,6 +136,15 @@ void processSerialInput() {
 
 void processCommand(String command) {
   command.trim();
+  
+  // Handle password input specially (don't convert to lowercase)
+  if (awaitingPasswordInput) {
+    DEBUG_PRINTF("[DEBUG] Processing password input\n");
+    connectToSelectedNetwork(command);
+    return;
+  }
+  
+  // Convert to lowercase for command matching
   command.toLowerCase();
   
   DEBUG_PRINTF("[DEBUG] Processing command: %s\n", command.c_str());
@@ -150,10 +167,19 @@ void processCommand(String command) {
     fetchWeatherData(url);
   } else if (command == "test") {
     runTestParsing();
+  } else if (command == "wifi scan") {
+    scanWiFiNetworks();
+  } else if (command.startsWith("wifi select ")) {
+    int networkIndex = command.substring(12).toInt();
+    selectWiFiNetwork(networkIndex);
   } else if (command == "wifi connect") {
-    connectWiFi();
+    connectToStoredNetwork();
   } else if (command == "wifi disconnect") {
     disconnectWiFi();
+  } else if (command == "wifi forget") {
+    clearStoredCredentials();
+  } else if (command == "wifi info") {
+    showWiFiInfo();
   } else if (command == "debug on") {
     debugMode = true;
     Serial.println("Debug mode enabled");
@@ -180,13 +206,20 @@ void showHelp() {
   Serial.println("==================");
   Serial.println("help                     - Show this help message");
   Serial.println("status                   - Show system and WiFi status");
+  Serial.println("\nWeather Parsing:");
   Serial.println("parse json <data>        - Parse JSON weather data");
   Serial.println("parse csv <data>         - Parse CSV weather data");
   Serial.println("parse xml <data>         - Parse XML weather data");
   Serial.println("fetch <url>              - Fetch weather data from URL");
   Serial.println("test                     - Run test parsing with sample data");
-  Serial.println("wifi connect             - Connect to configured WiFi");
+  Serial.println("\nWiFi Management:");
+  Serial.println("wifi scan                - Scan for available networks");
+  Serial.println("wifi select <index>      - Select network by index (from scan)");
+  Serial.println("wifi connect             - Connect to stored network");
   Serial.println("wifi disconnect          - Disconnect from WiFi");
+  Serial.println("wifi forget              - Clear stored credentials");
+  Serial.println("wifi info                - Show WiFi configuration info");
+  Serial.println("\nSystem:");
   Serial.println("debug on/off             - Toggle debug output");
   Serial.println("clear                    - Clear terminal screen");
   Serial.println();
@@ -413,4 +446,279 @@ void monitorWiFiStatus() {
     DEBUG_PRINTF("[DEBUG] WiFi state changed: %s\n", getWiFiStateString());
     lastState = newState;
   }
+}
+
+// =============================================================================
+// WIFI MANAGEMENT FUNCTIONS
+// =============================================================================
+
+void initializeWiFiManagement() {
+  // Initialize preferences for persistent storage
+  preferences.begin(PREFS_NAMESPACE, false);
+  
+  // Load stored credentials
+  loadStoredCredentials();
+  
+  DEBUG_PRINTF("[DEBUG] WiFi management initialized. Configured: %s\n", 
+               storedCredentials.isConfigured ? "YES" : "NO");
+  
+  if (storedCredentials.isConfigured) {
+    DEBUG_PRINTF("[DEBUG] Stored SSID: %s\n", storedCredentials.ssid);
+  }
+}
+
+void loadStoredCredentials() {
+  // Clear credentials structure
+  memset(&storedCredentials, 0, sizeof(WiFiCredentials));
+  
+  // Check if WiFi is configured
+  storedCredentials.isConfigured = preferences.getBool(PREFS_WIFI_CONFIGURED, false);
+  
+  if (storedCredentials.isConfigured) {
+    // Load SSID and password
+    preferences.getString(PREFS_WIFI_SSID, storedCredentials.ssid, WIFI_SSID_MAX_LEN);
+    preferences.getString(PREFS_WIFI_PASS, storedCredentials.password, WIFI_PASS_MAX_LEN);
+  }
+}
+
+void saveCredentials(const char* ssid, const char* password) {
+  // Store credentials in preferences
+  preferences.putString(PREFS_WIFI_SSID, ssid);
+  preferences.putString(PREFS_WIFI_PASS, password);
+  preferences.putBool(PREFS_WIFI_CONFIGURED, true);
+  
+  // Update local copy
+  strncpy(storedCredentials.ssid, ssid, WIFI_SSID_MAX_LEN);
+  strncpy(storedCredentials.password, password, WIFI_PASS_MAX_LEN);
+  storedCredentials.isConfigured = true;
+  
+  Serial.printf("[INFO] WiFi credentials saved for '%s'\n", ssid);
+}
+
+void clearStoredCredentials() {
+  preferences.putBool(PREFS_WIFI_CONFIGURED, false);
+  preferences.remove(PREFS_WIFI_SSID);
+  preferences.remove(PREFS_WIFI_PASS);
+  
+  memset(&storedCredentials, 0, sizeof(WiFiCredentials));
+  
+  Serial.println("[INFO] Stored WiFi credentials cleared");
+}
+
+void autoConnectWiFi() {
+  if (storedCredentials.isConfigured) {
+    Serial.printf("[INFO] Attempting auto-connect to '%s'...\n", storedCredentials.ssid);
+    connectToStoredNetwork();
+  } else {
+    Serial.println("[INFO] No stored WiFi credentials. Use 'wifi scan' to set up WiFi.");
+  }
+}
+
+void connectToStoredNetwork() {
+  if (!storedCredentials.isConfigured) {
+    Serial.println("[ERROR] No stored WiFi credentials available");
+    return;
+  }
+  
+  currentWiFiState = WIFI_CONNECTING;
+  WiFi.begin(storedCredentials.ssid, storedCredentials.password);
+  
+  unsigned long startTime = millis();
+  Serial.print("Connecting");
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    currentWiFiState = WIFI_CONNECTED;
+    Serial.println("[SUCCESS] WiFi connected!");
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+    digitalWrite(LED_BUILTIN_PIN, HIGH);
+  } else {
+    currentWiFiState = WIFI_CONNECTION_FAILED;
+    Serial.println("[ERROR] WiFi connection failed after 40 seconds");
+    Serial.println("[INFO] Use 'wifi scan' to select a different network");
+    lastWiFiReconnectAttempt = millis();
+  }
+}
+
+void scanWiFiNetworks() {
+  if (currentWiFiState == WIFI_SCANNING) {
+    Serial.println("[INFO] WiFi scan already in progress");
+    return;
+  }
+  
+  Serial.println("[INFO] Scanning for WiFi networks...");
+  currentWiFiState = WIFI_SCANNING;
+  
+  WiFi.disconnect();
+  delay(100);
+  
+  int networksFound = WiFi.scanNetworks();
+  
+  if (networksFound == 0) {
+    Serial.println("[ERROR] No WiFi networks found");
+    currentWiFiState = WIFI_DISCONNECTED;
+    return;
+  }
+  
+  // Store scan results
+  numScannedNetworks = min(networksFound, MAX_WIFI_NETWORKS);
+  
+  Serial.println("\nAvailable WiFi Networks:");
+  Serial.println("========================");
+  
+  for (int i = 0; i < numScannedNetworks; i++) {
+    scannedNetworks[i].ssid = WiFi.SSID(i);
+    scannedNetworks[i].rssi = WiFi.RSSI(i);
+    scannedNetworks[i].channel = WiFi.channel(i);
+    scannedNetworks[i].security = getSecurityType(WiFi.encryptionType(i));
+    
+    // Display network info
+    Serial.printf("%2d: %-20s", i, scannedNetworks[i].ssid.c_str());
+    Serial.printf(" %4d dBm  Ch:%2d  %s\n", 
+                  scannedNetworks[i].rssi,
+                  scannedNetworks[i].channel,
+                  getSecurityString(scannedNetworks[i].security));
+  }
+  
+  Serial.println("\nUse 'wifi select <number>' to connect to a network");
+  Serial.println("Example: wifi select 0");
+  
+  currentWiFiState = WIFI_SCAN_COMPLETE;
+}
+
+WiFiSecurityType getSecurityType(wifi_auth_mode_t authMode) {
+  switch (authMode) {
+    case WIFI_AUTH_OPEN: return WIFI_SECURITY_OPEN;
+    case WIFI_AUTH_WEP: return WIFI_SECURITY_WEP;
+    case WIFI_AUTH_WPA_PSK: return WIFI_SECURITY_WPA;
+    case WIFI_AUTH_WPA2_PSK: return WIFI_SECURITY_WPA2;
+    case WIFI_AUTH_WPA_WPA2_PSK: return WIFI_SECURITY_WPA2;
+    case WIFI_AUTH_WPA3_PSK: return WIFI_SECURITY_WPA3;
+    default: return WIFI_SECURITY_UNKNOWN;
+  }
+}
+
+const char* getSecurityString(WiFiSecurityType security) {
+  switch (security) {
+    case WIFI_SECURITY_OPEN: return "Open";
+    case WIFI_SECURITY_WEP: return "WEP";
+    case WIFI_SECURITY_WPA: return "WPA";
+    case WIFI_SECURITY_WPA2: return "WPA2";
+    case WIFI_SECURITY_WPA3: return "WPA3";
+    default: return "Unknown";
+  }
+}
+
+void selectWiFiNetwork(int networkIndex) {
+  if (currentWiFiState != WIFI_SCAN_COMPLETE) {
+    Serial.println("[ERROR] No scan results available. Use 'wifi scan' first.");
+    return;
+  }
+  
+  if (networkIndex < 0 || networkIndex >= numScannedNetworks) {
+    Serial.printf("[ERROR] Invalid network index. Valid range: 0-%d\n", numScannedNetworks - 1);
+    return;
+  }
+  
+  selectedNetworkIndex = networkIndex;
+  WiFiNetworkInfo* selectedNetwork = &scannedNetworks[networkIndex];
+  
+  Serial.printf("[INFO] Selected network: %s\n", selectedNetwork->ssid.c_str());
+  
+  if (selectedNetwork->security == WIFI_SECURITY_OPEN) {
+    // Open network - connect immediately
+    Serial.println("[INFO] Open network detected - connecting...");
+    connectToSelectedNetwork("");
+  } else {
+    // Secured network - request password
+    Serial.printf("[INFO] Enter password for '%s': ", selectedNetwork->ssid.c_str());
+    awaitingPasswordInput = true;
+  }
+}
+
+void connectToSelectedNetwork(String password) {
+  if (selectedNetworkIndex < 0 || selectedNetworkIndex >= numScannedNetworks) {
+    Serial.println("[ERROR] No network selected");
+    return;
+  }
+  
+  WiFiNetworkInfo* network = &scannedNetworks[selectedNetworkIndex];
+  
+  Serial.printf("[INFO] Connecting to '%s'...\n", network->ssid.c_str());
+  currentWiFiState = WIFI_CONNECTING;
+  
+  // Attempt connection
+  if (password.length() > 0) {
+    WiFi.begin(network->ssid.c_str(), password.c_str());
+  } else {
+    WiFi.begin(network->ssid.c_str());
+  }
+  
+  unsigned long startTime = millis();
+  Serial.print("Connecting");
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < WIFI_CONNECT_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    currentWiFiState = WIFI_CONNECTED;
+    Serial.println("[SUCCESS] WiFi connected!");
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+    
+    // Save credentials for future use
+    saveCredentials(network->ssid.c_str(), password.c_str());
+    
+    digitalWrite(LED_BUILTIN_PIN, HIGH);
+  } else {
+    currentWiFiState = WIFI_CONNECTION_FAILED;
+    Serial.println("[ERROR] WiFi connection failed - incorrect password or other issue");
+  }
+  
+  // Reset selection state
+  selectedNetworkIndex = -1;
+  awaitingPasswordInput = false;
+}
+
+void showWiFiInfo() {
+  Serial.println("\nWiFi Configuration:");
+  Serial.println("===================");
+  
+  Serial.printf("Current State: %s\n", getWiFiStateString());
+  
+  if (storedCredentials.isConfigured) {
+    Serial.printf("Stored Network: %s\n", storedCredentials.ssid);
+    Serial.println("Status: Configured");
+  } else {
+    Serial.println("Status: Not configured");
+    Serial.println("Use 'wifi scan' to set up WiFi connection");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nCurrent Connection:");
+    Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Subnet Mask: %s\n", WiFi.subnetMask().toString().c_str());
+    Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+    Serial.printf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+    Serial.printf("Channel: %d\n", WiFi.channel());
+    Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
+  }
+  
+  if (numScannedNetworks > 0) {
+    Serial.printf("\nLast Scan Results: %d networks found\n", numScannedNetworks);
+    Serial.printf("Use 'wifi scan' to refresh\n");
+  }
+  
+  Serial.println();
 }
