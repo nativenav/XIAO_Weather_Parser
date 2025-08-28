@@ -317,34 +317,7 @@ void fetchWeatherData(String url) {
   Serial.println("[INFO] HTTP client not yet implemented");
 }
 
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("[INFO] Already connected to WiFi");
-    return;
-  }
-  
-  Serial.printf("[INFO] Connecting to WiFi: %s\n", ssid);
-  currentWiFiState = WIFI_CONNECTING;
-  
-  WiFi.begin(ssid, password);
-  
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < WIFI_CONNECT_TIMEOUT) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    currentWiFiState = WIFI_CONNECTED;
-    Serial.println("[SUCCESS] WiFi connected!");
-    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-    digitalWrite(LED_BUILTIN_PIN, HIGH); // LED on when connected
-  } else {
-    currentWiFiState = WIFI_CONNECTION_FAILED;
-    Serial.println("[ERROR] WiFi connection failed");
-  }
-}
+// Removed old connectWiFi function - now using connectToStoredNetwork()
 
 void disconnectWiFi() {
   WiFi.disconnect();
