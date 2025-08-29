@@ -551,7 +551,7 @@ void parseSeaviewData(String jsonData, unsigned long fetchTime) {
   int windDirection = 0;
   float temperature = 0.0;
   
-  // Parse current conditions
+  // Parse current conditions - prioritize 2-minute averages for more stable readings
   for (JsonObject condition : conditions) {
     String dataName = condition["sensorDataName"] | "";
     String value = condition["convertedValue"] | "";
@@ -562,26 +562,50 @@ void parseSeaviewData(String jsonData, unsigned long fetchTime) {
     
     DEBUG_PRINTF("[DEBUG] Found: %s = %s %s\n", dataName.c_str(), value.c_str(), unit.c_str());
     
-    if (dataName == "Wind Speed") {
+    // Prioritize 2-minute average wind speed for more stable readings
+    if (dataName.indexOf("2 Min") >= 0 && dataName.indexOf("Wind Speed") >= 0) {
       windSpeed = value.toFloat();
       if (unit == "knots") {
-        data.windSpeed = windSpeed * 0.514444; // Convert to m/s
+        data.windSpeed = windSpeed * 0.514444; // Convert knots to m/s
       } else {
         data.windSpeed = windSpeed; // Assume m/s
       }
-    } else if (dataName == "Wind Direction") {
+      DEBUG_PRINTF("[DEBUG] Using 2-min avg wind speed: %.1f\n", windSpeed);
+    } else if (dataName == "Wind Speed" && data.windSpeed == 0.0) {
+      // Fallback to current wind speed if no 2-min average found
+      windSpeed = value.toFloat();
+      if (unit == "knots") {
+        data.windSpeed = windSpeed * 0.514444; // Convert knots to m/s
+      } else {
+        data.windSpeed = windSpeed; // Assume m/s
+      }
+    }
+    
+    // Prioritize 2-minute average wind direction
+    if (dataName.indexOf("2 Min") >= 0 && dataName.indexOf("Wind Direction") >= 0) {
       data.windDirection = value.toInt();
-    } else if (dataName.indexOf("High Wind Speed") >= 0 || dataName.indexOf("10 Min High") >= 0) {
+      DEBUG_PRINTF("[DEBUG] Using 2-min avg wind direction: %d\n", data.windDirection);
+    } else if (dataName == "Wind Direction" && data.windDirection == 0) {
+      // Fallback to current wind direction if no 2-min average found
+      data.windDirection = value.toInt();
+    }
+    
+    // Look for wind gust data (10-minute high or other high values)
+    if (dataName.indexOf("High Wind Speed") >= 0 || dataName.indexOf("10 Min High") >= 0) {
       float gustValue = value.toFloat();
       if (gustValue > windGust) {
         windGust = gustValue;
         if (unit == "knots") {
-          data.windGust = windGust * 0.514444; // Convert to m/s
+          data.windGust = windGust * 0.514444; // Convert knots to m/s
         } else {
           data.windGust = windGust; // Assume m/s
         }
+        DEBUG_PRINTF("[DEBUG] Wind gust found: %.1f %s\n", gustValue, unit.c_str());
       }
-    } else if (dataName.indexOf("Temperature") >= 0 || dataName.indexOf("Temp") >= 0) {
+    }
+    
+    // Temperature data
+    if (dataName.indexOf("Temperature") >= 0 || dataName.indexOf("Temp") >= 0) {
       data.temperature = value.toFloat();
     }
   }
@@ -718,22 +742,41 @@ void parseLymingtonData(String jsonData, unsigned long fetchTime) {
     return;
   }
   
-  // Parse weather parameters
-  // Based on your example: {"wdc":262,"wsc":9.36}
-  // wdc = wind direction in degrees
-  // wsc = wind speed (likely in m/s or knots - need to determine)
-  
-  if (dataObj.containsKey("wdc")) {
-    data.windDirection = dataObj["wdc"] | 0;
-    DEBUG_PRINTF("[DEBUG] Wind Direction: %d degrees\n", data.windDirection);
-  }
+  // Parse weather parameters with priority for average values
+  // WeatherFile API provides various wind parameters:
+  // wdc = wind direction, wsc = wind speed, wgc = wind gust
+  // Look for average values first (more stable), then current/max
   
   float windSpeedRaw = 0.0;
-  if (dataObj.containsKey("wsc")) {
-    windSpeedRaw = dataObj["wsc"] | 0.0;
-    // WeatherFile uses knots based on URL parameter wt=KTS
-    data.windSpeed = windSpeedRaw * 0.514444; // Convert knots to m/s
-    DEBUG_PRINTF("[DEBUG] Wind Speed: %.2f knots = %.2f m/s\n", windSpeedRaw, data.windSpeed);
+  float windGustRaw = 0.0;
+  
+  // Parse all available wind parameters
+  for (JsonPair kv : dataObj) {
+    String key = kv.key().c_str();
+    float value = kv.value() | 0.0;
+    
+    DEBUG_PRINTF("[DEBUG] Found parameter: %s = %.2f\n", key.c_str(), value);
+    
+    // Wind direction (prioritize average direction)
+    if (key == "wdc_avg" || (key == "wdc" && data.windDirection == 0)) {
+      data.windDirection = (int)value;
+      DEBUG_PRINTF("[DEBUG] Wind Direction (%s): %d degrees\n", key.c_str(), data.windDirection);
+    }
+    
+    // Wind speed (prioritize average speed for stability)
+    if (key == "wsc_avg" || (key == "wsc" && windSpeedRaw == 0.0)) {
+      windSpeedRaw = value;
+      // WeatherFile uses knots based on URL parameter wt=KTS
+      data.windSpeed = windSpeedRaw * 0.514444; // Convert knots to m/s
+      DEBUG_PRINTF("[DEBUG] Wind Speed (%s): %.2f knots = %.2f m/s\n", key.c_str(), windSpeedRaw, data.windSpeed);
+    }
+    
+    // Wind gust (look for max gust values)
+    if (key == "wgc_max" || key == "wgc" || (key.indexOf("gust") >= 0 && value > windGustRaw)) {
+      windGustRaw = value;
+      data.windGust = windGustRaw * 0.514444; // Convert knots to m/s
+      DEBUG_PRINTF("[DEBUG] Wind Gust (%s): %.2f knots = %.2f m/s\n", key.c_str(), windGustRaw, data.windGust);
+    }
   }
   
   // Extract timestamp
@@ -768,9 +811,12 @@ void parseLymingtonData(String jsonData, unsigned long fetchTime) {
   // Display results
   Serial.println("\n=== LYMINGTON WEATHER STATION ===");
   Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", windSpeedRaw, data.windSpeed);
+  if (windGustRaw > 0.0) {
+    Serial.printf("Wind Gust: %.1f knots (%.1f m/s)\n", windGustRaw, data.windGust);
+  }
   Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
   Serial.printf("Location: %s\n", data.location.c_str());
-  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Last Updated: %s\n", ensureGMTTimestamp(data.timestamp).c_str());
   if (delay > 0) {
     Serial.printf("Data Delay: %d minutes\n", delay);
   }
@@ -883,6 +929,31 @@ float knotsToMeterPerSecond(float knots) {
 // Convert m/s to knots
 float meterPerSecondToKnots(float mps) {
   return mps / 0.514444;
+}
+
+// Get current UTC timestamp string
+String getCurrentUTCTimestamp() {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  
+  char timestamp[32];
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+  return String(timestamp);
+}
+
+// Convert timestamp to GMT indication if needed
+String ensureGMTTimestamp(String timestamp) {
+  if (timestamp.length() == 0 || timestamp == "Live data") {
+    return getCurrentUTCTimestamp();
+  }
+  
+  // If timestamp doesn't end with Z or GMT, assume it needs conversion indication
+  if (!timestamp.endsWith("Z") && timestamp.indexOf("GMT") == -1 && timestamp.indexOf("UTC") == -1) {
+    return timestamp + " GMT";
+  }
+  
+  return timestamp;
 }
 
 // =============================================================================
