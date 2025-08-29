@@ -167,6 +167,8 @@ void processCommand(String command) {
     fetchWeatherData(url);
   } else if (command == "brambles") {
     fetchBramblesWeather();
+  } else if (command == "seaview") {
+    fetchSeaviewWeather();
   } else if (command == "test") {
     runTestParsing();
   } else if (command == "wifi scan") {
@@ -214,6 +216,7 @@ void showHelp() {
   Serial.println("parse xml <data>         - Parse XML weather data");
   Serial.println("fetch <url>              - Fetch weather data from URL");
   Serial.println("brambles                 - Fetch Brambles Bank weather station data");
+  Serial.println("seaview                  - Fetch Seaview, Isle of Wight weather station data");
   Serial.println("test                     - Run test parsing with sample data");
   Serial.println("\nWiFi Management:");
   Serial.println("wifi scan                - Scan for available networks");
@@ -456,6 +459,183 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
   Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
   Serial.println("=============================");
+}
+
+void fetchSeaviewWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi not connected. Use 'wifi connect' first.");
+    return;
+  }
+  
+  Serial.println("[INFO] Fetching Seaview weather data...");
+  
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT);
+  
+  String url = "https://www.weatherlink.com/embeddablePage/summaryData/0d117f9a7c7e425a8cc88e870f0e76fb";
+  
+  // Begin HTTPS request 
+  http.begin(url);
+  
+  // Set specific headers for WeatherLink
+  http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
+  http.addHeader("Accept", "application/json,*/*");
+  http.addHeader("X-Requested-With", "XMLHttpRequest");
+  http.addHeader("Referer", "https://www.weatherlink.com/embeddablePage/show/0d117f9a7c7e425a8cc88e870f0e76fb/summary");
+  
+  unsigned long startTime = millis();
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    unsigned long fetchTime = millis() - startTime;
+    
+    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    
+    // Parse the Seaview weather data
+    parseSeaviewData(payload, fetchTime);
+    
+  } else {
+    Serial.printf("[ERROR] Failed to fetch Seaview data. HTTP %d: %s\n", 
+                  httpCode, http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+void parseSeaviewData(String jsonData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Seaview weather data...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Seaview, Isle of Wight";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse JSON using ArduinoJson library
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+  DeserializationError error = deserializeJson(doc, jsonData);
+  
+  if (error) {
+    Serial.printf("[ERROR] JSON parsing failed: %s\n", error.c_str());
+    return;
+  }
+  
+  // Handle both array and object root structures
+  JsonObject rootObj;
+  if (doc.is<JsonArray>()) {
+    if (doc.size() > 0) {
+      rootObj = doc[0];
+    } else {
+      Serial.println("[ERROR] Empty JSON array");
+      return;
+    }
+  } else {
+    rootObj = doc.as<JsonObject>();
+  }
+  
+  // Extract current conditions array
+  JsonArray conditions = rootObj["currConditionValues"];
+  if (conditions.isNull()) {
+    Serial.println("[ERROR] currConditionValues not found in JSON");
+    return;
+  }
+  
+  float windSpeed = 0.0;
+  float windGust = 0.0;
+  int windDirection = 0;
+  float temperature = 0.0;
+  
+  // Parse current conditions
+  for (JsonObject condition : conditions) {
+    String dataName = condition["sensorDataName"] | "";
+    String value = condition["convertedValue"] | "";
+    String unit = condition["unitLabel"] | "";
+    
+    // Skip invalid values
+    if (value == "--" || value == "" || value == "null") continue;
+    
+    DEBUG_PRINTF("[DEBUG] Found: %s = %s %s\n", dataName.c_str(), value.c_str(), unit.c_str());
+    
+    if (dataName == "Wind Speed") {
+      windSpeed = value.toFloat();
+      if (unit == "knots") {
+        data.windSpeed = windSpeed * 0.514444; // Convert to m/s
+      } else {
+        data.windSpeed = windSpeed; // Assume m/s
+      }
+    } else if (dataName == "Wind Direction") {
+      data.windDirection = value.toInt();
+    } else if (dataName.indexOf("High Wind Speed") >= 0 || dataName.indexOf("10 Min High") >= 0) {
+      float gustValue = value.toFloat();
+      if (gustValue > windGust) {
+        windGust = gustValue;
+        if (unit == "knots") {
+          data.windGust = windGust * 0.514444; // Convert to m/s
+        } else {
+          data.windGust = windGust; // Assume m/s
+        }
+      }
+    } else if (dataName.indexOf("Temperature") >= 0 || dataName.indexOf("Temp") >= 0) {
+      data.temperature = value.toFloat();
+    }
+  }
+  
+  // Check for high/low values array for additional gust data
+  JsonArray extremes = rootObj["highLowValues"];
+  if (!extremes.isNull()) {
+    for (JsonObject extreme : extremes) {
+      String dataName = extreme["sensorDataName"] | "";
+      String value = extreme["convertedValue"] | "";
+      String unit = extreme["unitLabel"] | "";
+      
+      if (value == "--" || value == "" || value == "null") continue;
+      
+      DEBUG_PRINTF("[DEBUG] Found extreme: %s = %s %s\n", dataName.c_str(), value.c_str(), unit.c_str());
+      
+      if (dataName.indexOf("High Wind Speed") >= 0) {
+        float dailyGust = value.toFloat();
+        if (dailyGust > windGust) {
+          windGust = dailyGust;
+          if (unit == "knots") {
+            data.windGust = windGust * 0.514444; // Convert to m/s
+          } else {
+            data.windGust = windGust; // Assume m/s
+          }
+        }
+      }
+    }
+  }
+  
+  // Set timestamp from lastUpdate if available
+  String lastUpdate = rootObj["lastUpdate"] | "";
+  if (lastUpdate.length() > 0) {
+    data.timestamp = lastUpdate;
+  } else {
+    data.timestamp = "Live data";
+  }
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = (data.windSpeed >= 0 || data.windDirection >= 0);
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== SEAVIEW WEATHER STATION ===");
+  Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", windSpeed, data.windSpeed);
+  Serial.printf("Wind Gust: %.1f knots (%.1f m/s)\n", windGust, data.windGust);
+  Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+  if (data.temperature > 0.0) {
+    Serial.printf("Temperature: %.1f°C\n", data.temperature);
+  } else {
+    Serial.println("Temperature: n/a");
+  }
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("===============================");
 }
 
 // Removed old connectWiFi function - now using connectToStoredNetwork()
