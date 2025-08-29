@@ -169,6 +169,8 @@ void processCommand(String command) {
     fetchBramblesWeather();
   } else if (command == "seaview") {
     fetchSeaviewWeather();
+  } else if (command == "lymington") {
+    fetchLymingtonWeather();
   } else if (command == "test") {
     runTestParsing();
   } else if (command == "wifi scan") {
@@ -217,6 +219,7 @@ void showHelp() {
   Serial.println("fetch <url>              - Fetch weather data from URL");
   Serial.println("brambles                 - Fetch Brambles Bank weather station data");
   Serial.println("seaview                  - Fetch Seaview, Isle of Wight weather station data");
+  Serial.println("lymington                - Fetch Lymington Starting Platform weather station data");
   Serial.println("test                     - Run test parsing with sample data");
   Serial.println("\nWiFi Management:");
   Serial.println("wifi scan                - Scan for available networks");
@@ -636,6 +639,143 @@ void parseSeaviewData(String jsonData, unsigned long fetchTime) {
   Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
   Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
   Serial.println("===============================");
+}
+
+void fetchLymingtonWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi not connected. Use 'wifi connect' first.");
+    return;
+  }
+  
+  Serial.println("[INFO] Fetching Lymington weather data...");
+  
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT);
+  
+  String url = "https://weatherfile.com/V03/loc/GBR00001/latest.json";
+  
+  // Begin HTTPS request 
+  http.begin(url);
+  
+  // Set specific headers for WeatherFile.com
+  http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
+  http.addHeader("Accept", "application/json,*/*");
+  http.addHeader("X-Requested-With", "XMLHttpRequest");
+  http.addHeader("Referer", "https://weatherfile.com/location?loc_id=GBR00001&wt=KTS");
+  
+  unsigned long startTime = millis();
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    unsigned long fetchTime = millis() - startTime;
+    
+    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    
+    // Parse the Lymington weather data
+    parseLymingtonData(payload, fetchTime);
+    
+  } else {
+    Serial.printf("[ERROR] Failed to fetch Lymington data. HTTP %d: %s\n", 
+                  httpCode, http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+void parseLymingtonData(String jsonData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Lymington weather data...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Lymington Starting Platform";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse JSON using ArduinoJson library
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+  DeserializationError error = deserializeJson(doc, jsonData);
+  
+  if (error) {
+    Serial.printf("[ERROR] JSON parsing failed: %s\n", error.c_str());
+    return;
+  }
+  
+  // Check if the response was successful
+  String status = doc["status"] | "";
+  if (status != "ok") {
+    String message = doc["message"] | "Unknown error";
+    Serial.printf("[ERROR] API returned error: %s\n", message.c_str());
+    return;
+  }
+  
+  // Extract data object
+  JsonObject dataObj = doc["data"];
+  if (dataObj.isNull()) {
+    Serial.println("[ERROR] No data object found in response");
+    return;
+  }
+  
+  // Parse weather parameters
+  // Based on your example: {"wdc":262,"wsc":9.36}
+  // wdc = wind direction in degrees
+  // wsc = wind speed (likely in m/s or knots - need to determine)
+  
+  if (dataObj.containsKey("wdc")) {
+    data.windDirection = dataObj["wdc"] | 0;
+    DEBUG_PRINTF("[DEBUG] Wind Direction: %d degrees\n", data.windDirection);
+  }
+  
+  float windSpeedRaw = 0.0;
+  if (dataObj.containsKey("wsc")) {
+    windSpeedRaw = dataObj["wsc"] | 0.0;
+    // WeatherFile uses knots based on URL parameter wt=KTS
+    data.windSpeed = windSpeedRaw * 0.514444; // Convert knots to m/s
+    DEBUG_PRINTF("[DEBUG] Wind Speed: %.2f knots = %.2f m/s\n", windSpeedRaw, data.windSpeed);
+  }
+  
+  // Extract timestamp
+  String timestamp = dataObj["ts"] | "";
+  if (timestamp.length() > 0) {
+    data.timestamp = timestamp;
+    DEBUG_PRINTF("[DEBUG] Timestamp: %s\n", timestamp.c_str());
+  } else {
+    data.timestamp = "Live data";
+  }
+  
+  // Extract location name (more descriptive than hardcoded)
+  String locName = dataObj["loc_name"] | "Lymington Starting Platform";
+  data.location = locName;
+  
+  // Extract coordinates for reference
+  float lat = dataObj["lat"] | 0.0;
+  float lng = dataObj["lng"] | 0.0;
+  DEBUG_PRINTF("[DEBUG] Location: %s (%.4f, %.4f)\n", locName.c_str(), lat, lng);
+  
+  // Extract data quality info
+  int delay = dataObj["delay"] | 0;
+  int numParams = dataObj["num_params"] | 0;
+  DEBUG_PRINTF("[DEBUG] Data delay: %d min, Parameters: %d\n", delay, numParams);
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = (data.windSpeed >= 0.0 || data.windDirection >= 0);
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== LYMINGTON WEATHER STATION ===");
+  Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", windSpeedRaw, data.windSpeed);
+  Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+  Serial.printf("Location: %s\n", data.location.c_str());
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  if (delay > 0) {
+    Serial.printf("Data Delay: %d minutes\n", delay);
+  }
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("=================================");
 }
 
 // Removed old connectWiFi function - now using connectToStoredNetwork()
