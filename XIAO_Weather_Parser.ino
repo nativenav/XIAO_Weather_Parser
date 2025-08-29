@@ -165,6 +165,8 @@ void processCommand(String command) {
   } else if (command.startsWith("fetch ")) {
     String url = command.substring(6);
     fetchWeatherData(url);
+  } else if (command == "brambles") {
+    fetchBramblesWeather();
   } else if (command == "test") {
     runTestParsing();
   } else if (command == "wifi scan") {
@@ -211,6 +213,7 @@ void showHelp() {
   Serial.println("parse csv <data>         - Parse CSV weather data");
   Serial.println("parse xml <data>         - Parse XML weather data");
   Serial.println("fetch <url>              - Fetch weather data from URL");
+  Serial.println("brambles                 - Fetch Brambles Bank weather station data");
   Serial.println("test                     - Run test parsing with sample data");
   Serial.println("\nWiFi Management:");
   Serial.println("wifi scan                - Scan for available networks");
@@ -295,7 +298,7 @@ void parseWeatherXML(String xmlData) {
 }
 
 // =============================================================================
-// NETWORK FUNCTIONS - TODO: IMPLEMENT THESE
+// NETWORK FUNCTIONS
 // =============================================================================
 
 void fetchWeatherData(String url) {
@@ -306,15 +309,153 @@ void fetchWeatherData(String url) {
   
   Serial.printf("[INFO] Fetching data from: %s\n", url.c_str());
   
-  // TODO: Implement HTTP/HTTPS client
-  // 1. Create HTTPClient instance
-  // 2. Set timeout and user agent
-  // 3. Make GET request to URL
-  // 4. Handle response codes and redirects
-  // 5. Parse response data based on content type
-  // 6. Display results
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT);
   
-  Serial.println("[INFO] HTTP client not yet implemented");
+  // Begin HTTP request
+  http.begin(url);
+  
+  // Set standard headers
+  http.addHeader("User-Agent", USER_AGENT);
+  http.addHeader("Accept", "text/html,*/*");
+  
+  unsigned long startTime = millis();
+  int httpCode = http.GET();
+  
+  if (httpCode > 0) {
+    String payload = http.getString();
+    unsigned long fetchTime = millis() - startTime;
+    
+    Serial.printf("[INFO] HTTP %d - Received %d bytes in %lu ms\n", 
+                  httpCode, payload.length(), fetchTime);
+    
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Response data:");
+      Serial.println(payload);
+    } else {
+      Serial.printf("[WARNING] HTTP error code: %d\n", httpCode);
+    }
+  } else {
+    Serial.printf("[ERROR] HTTP request failed: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+// =============================================================================
+// WEATHER STATION SPECIFIC FUNCTIONS
+// =============================================================================
+
+void fetchBramblesWeather() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[ERROR] WiFi not connected. Use 'wifi connect' first.");
+    return;
+  }
+  
+  Serial.println("[INFO] Fetching Brambles weather data...");
+  
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT);
+  
+  String url = "https://www.southamptonvts.co.uk/BackgroundSite/Ajax/LoadXmlFileWithTransform?xmlFilePath=D%3A%5Cftp%5Csouthampton%5CBramble.xml&xslFilePath=D%3A%5Cwwwroot%5CCMS_Southampton%5Ccontent%5Cfiles%5Cassets%5CSotonSnapshotmetBramble.xsl&w=51";
+  
+  // Begin HTTPS request 
+  http.begin(url);
+  
+  // Set specific headers for Southampton VTS
+  http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
+  http.addHeader("Accept", "text/html,*/*");
+  http.addHeader("Referer", "https://www.southamptonvts.co.uk/Live_Information/Tides_and_Weather/");
+  
+  unsigned long startTime = millis();
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    unsigned long fetchTime = millis() - startTime;
+    
+    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    
+    // Parse the Brambles weather data
+    parseBramblesData(payload, fetchTime);
+    
+  } else {
+    Serial.printf("[ERROR] Failed to fetch Brambles data. HTTP %d: %s\n", 
+                  httpCode, http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+}
+
+void parseBramblesData(String htmlData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Brambles weather data...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Brambles Bank";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse each field from the HTML text
+  // Format: "Bramble Bank Wind Speed 19.8 Knots Max Gust 20.6 Knots Wind Direction 335 Degree Tide Height .0 m Air Temp 17.4 C Pressure 997.4 mBar Visibility .0 nM Updated 29/08/2025 14:13:00"
+  
+  // Extract wind speed in knots
+  float windSpeedKnots = extractFloatAfterPhrase(htmlData, "Wind Speed ", " Knots");
+  if (windSpeedKnots > 0) {
+    data.windSpeed = windSpeedKnots * 0.514444; // Convert knots to m/s
+    DEBUG_PRINTF("[DEBUG] Wind Speed: %.1f knots = %.1f m/s\n", windSpeedKnots, data.windSpeed);
+  } else {
+    DEBUG_PRINTLN("[DEBUG] Wind Speed: n/a");
+  }
+  
+  // Extract wind gust in knots
+  float windGustKnots = extractFloatAfterPhrase(htmlData, "Max Gust ", " Knots");
+  if (windGustKnots > 0) {
+    data.windGust = windGustKnots * 0.514444; // Convert knots to m/s
+    DEBUG_PRINTF("[DEBUG] Wind Gust: %.1f knots = %.1f m/s\n", windGustKnots, data.windGust);
+  } else {
+    DEBUG_PRINTLN("[DEBUG] Wind Gust: n/a");
+  }
+  
+  // Extract wind direction in degrees
+  data.windDirection = (int)extractFloatAfterPhrase(htmlData, "Wind Direction ", " Degree");
+  DEBUG_PRINTF("[DEBUG] Wind Direction: %d degrees\n", data.windDirection);
+  
+  // Extract air temperature in Celsius
+  data.temperature = extractFloatAfterPhrase(htmlData, "Air Temp ", " C");
+  DEBUG_PRINTF("[DEBUG] Temperature: %.1f°C\n", data.temperature);
+  
+  // Extract pressure in mBar and convert to hPa (same value, different name)
+  data.pressure = extractFloatAfterPhrase(htmlData, "Pressure ", " mBar");
+  DEBUG_PRINTF("[DEBUG] Pressure: %.1f mBar (%.1f hPa)\n", data.pressure, data.pressure);
+  
+  // Extract timestamp
+  String timestamp = extractStringAfterPhrase(htmlData, "Updated ", "");
+  if (timestamp.length() > 0) {
+    data.timestamp = timestamp;
+    DEBUG_PRINTF("[DEBUG] Timestamp: %s\n", timestamp.c_str());
+  } else {
+    DEBUG_PRINTLN("[DEBUG] Timestamp: n/a");
+  }
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = true;
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== BRAMBLES BANK WEATHER ===");
+  Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", windSpeedKnots, data.windSpeed);
+  Serial.printf("Wind Gust: %.1f knots (%.1f m/s)\n", windGustKnots, data.windGust);
+  Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+  Serial.printf("Air Temperature: %.1f°C\n", data.temperature);
+  Serial.printf("Air Pressure: %.1f mBar\n", data.pressure);
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("=============================");
 }
 
 // Removed old connectWiFi function - now using connectToStoredNetwork()
@@ -353,6 +494,78 @@ void runTestParsing() {
 }
 
 // =============================================================================
+// HTML PARSING UTILITY FUNCTIONS
+// =============================================================================
+
+// Extract a float value that appears after a specific phrase and before an end phrase
+float extractFloatAfterPhrase(String text, String startPhrase, String endPhrase) {
+  int startIndex = text.indexOf(startPhrase);
+  if (startIndex == -1) {
+    DEBUG_PRINTF("[DEBUG] Start phrase '%s' not found\n", startPhrase.c_str());
+    return 0.0;
+  }
+  
+  startIndex += startPhrase.length();
+  
+  int endIndex;
+  if (endPhrase.length() > 0) {
+    endIndex = text.indexOf(endPhrase, startIndex);
+    if (endIndex == -1) {
+      DEBUG_PRINTF("[DEBUG] End phrase '%s' not found after start\n", endPhrase.c_str());
+      return 0.0;
+    }
+  } else {
+    // Find next space or end of string if no end phrase specified
+    endIndex = text.indexOf(' ', startIndex);
+    if (endIndex == -1) endIndex = text.length();
+  }
+  
+  String valueStr = text.substring(startIndex, endIndex);
+  valueStr.trim();
+  
+  DEBUG_PRINTF("[DEBUG] Extracted value string: '%s'\n", valueStr.c_str());
+  
+  return valueStr.toFloat();
+}
+
+// Extract a string value that appears after a specific phrase
+String extractStringAfterPhrase(String text, String startPhrase, String endPhrase) {
+  int startIndex = text.indexOf(startPhrase);
+  if (startIndex == -1) {
+    DEBUG_PRINTF("[DEBUG] Start phrase '%s' not found\n", startPhrase.c_str());
+    return "";
+  }
+  
+  startIndex += startPhrase.length();
+  
+  int endIndex;
+  if (endPhrase.length() > 0) {
+    endIndex = text.indexOf(endPhrase, startIndex);
+    if (endIndex == -1) endIndex = text.length();
+  } else {
+    // Take everything to the end of the string
+    endIndex = text.length();
+  }
+  
+  String result = text.substring(startIndex, endIndex);
+  result.trim();
+  
+  DEBUG_PRINTF("[DEBUG] Extracted string: '%s'\n", result.c_str());
+  
+  return result;
+}
+
+// Convert knots to m/s
+float knotsToMeterPerSecond(float knots) {
+  return knots * 0.514444;
+}
+
+// Convert m/s to knots
+float meterPerSecondToKnots(float mps) {
+  return mps / 0.514444;
+}
+
+// =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
 
@@ -361,6 +574,7 @@ void initializeWeatherData(WeatherData* data) {
   data->humidity = 0.0;
   data->pressure = 0.0;
   data->windSpeed = 0.0;
+  data->windGust = 0.0;
   data->windDirection = 0;
   data->visibility = 0.0;
   data->uvIndex = 0.0;
@@ -377,6 +591,9 @@ void displayWeatherData(WeatherData* data) {
   Serial.printf("Humidity: %.1f%%\n", data->humidity);
   Serial.printf("Pressure: %.1f hPa\n", data->pressure);
   Serial.printf("Wind: %.1f m/s at %d°\n", data->windSpeed, data->windDirection);
+  if (data->windGust > 0.0) {
+    Serial.printf("Wind Gust: %.1f m/s\n", data->windGust);
+  }
   Serial.printf("Visibility: %.1f km\n", data->visibility);
   Serial.printf("UV Index: %.1f\n", data->uvIndex);
   Serial.printf("Precipitation: %.1f mm\n", data->precipitation);

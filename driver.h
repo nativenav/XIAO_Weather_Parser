@@ -65,6 +65,7 @@ struct WeatherData {
   float humidity;         // Relative humidity percentage
   float pressure;         // Atmospheric pressure in hPa
   float windSpeed;        // Wind speed in m/s
+  float windGust;         // Wind gust speed in m/s
   int windDirection;      // Wind direction in degrees (0-359)
   float visibility;       // Visibility in kilometers
   float uvIndex;          // UV index
