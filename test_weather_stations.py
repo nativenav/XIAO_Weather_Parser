@@ -33,8 +33,35 @@ def validate_wind_data(speed_knots, direction, name="Wind"):
         
     return valid
 
+def extract_table_cell_value(html_content, label):
+    """Extract value from HTML table cell format: <td>Label</td><td>Value Units</td>"""
+    import re
+    
+    # Pattern to find the label cell followed by value cell
+    pattern = rf'<td>\s*{re.escape(label)}\s*</td>\s*<td>([^<]+)</td>'
+    match = re.search(pattern, html_content, re.IGNORECASE)
+    
+    if match:
+        value_cell = match.group(1).strip()
+        # Check for embedded div tags (like timestamps)
+        div_match = re.search(r'<div[^>]*>([^<]+)</div>', value_cell)
+        if div_match:
+            return div_match.group(1).strip()
+        return value_cell
+    
+    return None
+
+def extract_numeric_from_value(value_str):
+    """Extract numeric value from string like '15.7 Knots'"""
+    if not value_str:
+        return None
+    
+    import re
+    match = re.search(r'([0-9]+\.?[0-9]*)', value_str)
+    return float(match.group(1)) if match else None
+
 def test_brambles_weather():
-    """Test Brambles Bank weather station (Southampton VTS)"""
+    """Test Brambles Bank weather station (Southampton VTS) - HTML Table Format"""
     print("🌊 Testing Brambles Bank Weather Station...")
     
     url = "https://www.southamptonvts.co.uk/BackgroundSite/Ajax/LoadXmlFileWithTransform?xmlFilePath=D%3A%5Cftp%5Csouthampton%5CBramble.xml&xslFilePath=D%3A%5Cwwwroot%5CCMS_Southampton%5Ccontent%5Cfiles%5Cassets%5CSotonSnapshotmetBramble.xsl&w=51"
@@ -49,12 +76,70 @@ def test_brambles_weather():
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             content = response.text
-            if "Bramble Bank" in content and "Wind Speed" in content:
-                print(f"  ✅ Success: Received {len(content)} bytes")
-                print(f"  📊 Content preview: {content[:100]}...")
-                return True
+            print(f"  ✅ Success: Received {len(content)} bytes")
+            
+            # Parse HTML table format
+            weather_data = {}
+            
+            # Extract wind speed
+            wind_speed_str = extract_table_cell_value(content, "Wind Speed")
+            if wind_speed_str:
+                wind_speed = extract_numeric_from_value(wind_speed_str)
+                if wind_speed:
+                    weather_data["wind_speed"] = f"{wind_speed} knots ({wind_speed * KNOTS_TO_MS:.1f} m/s)"
+            
+            # Extract wind gust
+            wind_gust_str = extract_table_cell_value(content, "Max Gust")
+            if wind_gust_str:
+                wind_gust = extract_numeric_from_value(wind_gust_str)
+                if wind_gust:
+                    weather_data["wind_gust"] = f"{wind_gust} knots ({wind_gust * KNOTS_TO_MS:.1f} m/s)"
+            
+            # Extract wind direction
+            wind_dir_str = extract_table_cell_value(content, "Wind Direction")
+            if wind_dir_str:
+                wind_dir = extract_numeric_from_value(wind_dir_str)
+                if wind_dir is not None:
+                    weather_data["wind_direction"] = f"{int(wind_dir)}°"
+            
+            # Extract temperature
+            temp_str = extract_table_cell_value(content, "Air Temp")
+            if temp_str:
+                temp = extract_numeric_from_value(temp_str)
+                if temp is not None:
+                    weather_data["temperature"] = f"{temp:.1f}°C"
+            
+            # Extract pressure
+            pressure_str = extract_table_cell_value(content, "Pressure")
+            if pressure_str:
+                pressure = extract_numeric_from_value(pressure_str)
+                if pressure is not None:
+                    weather_data["pressure"] = f"{pressure:.1f} mBar"
+            
+            # Extract timestamp
+            timestamp_str = extract_table_cell_value(content, "Updated")
+            if timestamp_str:
+                weather_data["timestamp"] = timestamp_str
+            
+            # Display parsed data
+            if weather_data:
+                print("  📊 Parsed weather data from HTML table:")
+                for key, value in weather_data.items():
+                    print(f"    ✅ {key.replace('_', ' ').title()}: {value}")
+                
+                # Validate we got essential data
+                essential_keys = ["wind_speed", "wind_direction"]
+                has_essential = any(key in weather_data for key in essential_keys)
+                
+                if has_essential:
+                    print("  ✅ Essential weather data successfully parsed")
+                    return True
+                else:
+                    print("  ⚠️  Parsed some data but missing essential wind information")
+                    return False
             else:
-                print(f"  ❌ Unexpected content format")
+                print(f"  ❌ Could not parse weather data from HTML table format")
+                print(f"  📊 Raw content preview: {content[:200]}...")
                 return False
         else:
             print(f"  ❌ HTTP Error: {response.status_code}")
@@ -138,20 +223,25 @@ def test_seaview_weather():
         return False
 
 def test_lymington_weather():
-    """Test Lymington weather station (WeatherFile.com) with enhanced parameter validation"""
+    """Test Lymington weather station (WeatherFile.com) with POST and wf-tkn header"""
     print("\n⚓ Testing Lymington Weather Station...")
     
+    # Use POST request with wf-tkn header as discovered in browser dev tools
     url = "https://weatherfile.com/V03/loc/GBR00001/latest.json"
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (compatible; WeatherStation/1.0)',
-        'Accept': 'application/json,*/*',
+        'Accept': '*/*',
         'X-Requested-With': 'XMLHttpRequest',
-        'Referer': 'https://weatherfile.com/location?loc_id=GBR00001&wt=KTS'
+        'Referer': 'https://weatherfile.com/location?loc_id=GBR00001&wt=KTS',
+        'Origin': 'https://weatherfile.com',
+        'Content-Length': '0',
+        'wf-tkn': 'PUBLIC'  # This is the key header we were missing!
     }
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        # Use POST request with empty body as discovered in browser dev tools
+        response = requests.post(url, headers=headers, data='', timeout=10)
         if response.status_code == 200:
             try:
                 data = response.json()
@@ -160,26 +250,32 @@ def test_lymington_weather():
                     print(f"  ✅ Success: API returned 'ok' status")
                     print(f"  📊 Found {len(weather_data)} parameters in response")
                     
-                    # Check for different types of wind data
-                    wind_params = {}
-                    for key, value in weather_data.items():
-                        if 'wsc' in key.lower():  # Wind speed
-                            wind_params[f"Wind Speed ({key})"] = f"{value} knots"
-                        elif 'wdc' in key.lower():  # Wind direction
-                            wind_params[f"Wind Direction ({key})"] = f"{value}°"
-                        elif 'wgc' in key.lower():  # Wind gust
-                            wind_params[f"Wind Gust ({key})"] = f"{value} knots"
+                    # Parse wind data - data is already in m/s despite wt=KTS URL parameter
+                    wind_speed_ms = 0.0
+                    wind_gust_ms = 0.0
+                    wind_direction = 0
                     
-                    # Display found wind parameters
-                    for param_name, param_value in wind_params.items():
-                        print(f"  ✅ {param_name}: {param_value}")
+                    for key, value in weather_data.items():
+                        if key == 'wsc_avg':  # Average wind speed (prioritize for stability)
+                            wind_speed_ms = value
+                            print(f"  ✅ Wind Speed (avg): {value} m/s")
+                        elif key == 'wsc' and wind_speed_ms == 0.0:  # Fallback to current
+                            wind_speed_ms = value
+                            print(f"  📊 Wind Speed (current): {value} m/s")
+                        elif key == 'wsc_max':  # Max wind speed as gust
+                            wind_gust_ms = value
+                            print(f"  ✅ Wind Gust (max): {value} m/s")
+                        elif key == 'wdc_avg' or (key == 'wdc' and wind_direction == 0):
+                            wind_direction = int(value)
+                            print(f"  ✅ Wind Direction ({key}): {int(value)}°")
                     
                     # Show basic parameters if no enhanced ones found
-                    if not wind_params:
-                        if 'wsc' in weather_data:
-                            print(f"  📊 Wind Speed: {weather_data['wsc']} knots")
-                        if 'wdc' in weather_data:
-                            print(f"  📊 Wind Direction: {weather_data['wdc']}°")
+                    if wind_speed_ms == 0.0 and 'wsc' in weather_data:
+                        wind_speed_ms = weather_data['wsc']
+                        print(f"  📊 Wind Speed: {wind_speed_ms} m/s")
+                    if wind_direction == 0 and 'wdc' in weather_data:
+                        wind_direction = int(weather_data['wdc'])
+                        print(f"  📊 Wind Direction: {wind_direction}°")
                     
                     # Show other useful info
                     if 'loc_name' in weather_data:

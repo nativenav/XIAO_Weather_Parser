@@ -360,38 +360,58 @@ void fetchBramblesWeather() {
   
   Serial.println("[INFO] Fetching Brambles weather data...");
   
-  HTTPClient http;
-  http.setTimeout(HTTP_TIMEOUT);
-  
   String url = "https://www.southamptonvts.co.uk/BackgroundSite/Ajax/LoadXmlFileWithTransform?xmlFilePath=D%3A%5Cftp%5Csouthampton%5CBramble.xml&xslFilePath=D%3A%5Cwwwroot%5CCMS_Southampton%5Ccontent%5Cfiles%5Cassets%5CSotonSnapshotmetBramble.xsl&w=51";
   
-  // Begin HTTPS request 
-  http.begin(url);
+  // Retry logic for connection issues
+  int maxRetries = 3;
+  int retryDelay = 2000; // 2 seconds between retries
   
-  // Set specific headers for Southampton VTS
-  http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
-  http.addHeader("Accept", "text/html,*/*");
-  http.addHeader("Referer", "https://www.southamptonvts.co.uk/Live_Information/Tides_and_Weather/");
-  
-  unsigned long startTime = millis();
-  int httpCode = http.GET();
-  
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    unsigned long fetchTime = millis() - startTime;
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT);
     
-    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
-    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    // Begin HTTPS request 
+    http.begin(url);
     
-    // Parse the Brambles weather data
-    parseBramblesData(payload, fetchTime);
+    // Set specific headers for Southampton VTS
+    http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
+    http.addHeader("Accept", "text/html,*/*");
+    http.addHeader("Referer", "https://www.southamptonvts.co.uk/Live_Information/Tides_and_Weather/");
     
-  } else {
-    Serial.printf("[ERROR] Failed to fetch Brambles data. HTTP %d: %s\n", 
-                  httpCode, http.errorToString(httpCode).c_str());
+    unsigned long startTime = millis();
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      unsigned long fetchTime = millis() - startTime;
+      
+      DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+      DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+      
+      // Parse the Brambles weather data
+      parseBramblesData(payload, fetchTime);
+      http.end();
+      return; // Success - exit retry loop
+      
+    } else {
+      Serial.printf("[ERROR] Attempt %d/%d failed. HTTP %d: %s\n", 
+                    attempt, maxRetries, httpCode, http.errorToString(httpCode).c_str());
+      
+      http.end();
+      
+      // If connection refused (-1) or timeout, retry after delay
+      if ((httpCode == -1 || httpCode == -11) && attempt < maxRetries) {
+        Serial.printf("[INFO] Retrying in %d seconds...\n", retryDelay / 1000);
+        delay(retryDelay);
+        retryDelay *= 1.5; // Exponential backoff
+      } else {
+        // Final failure or non-retryable error
+        break;
+      }
+    }
   }
   
-  http.end();
+  Serial.println("[ERROR] Failed to fetch Brambles data after all retry attempts");
 }
 
 void parseBramblesData(String htmlData, unsigned long fetchTime) {
@@ -404,11 +424,10 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   
   unsigned long parseStart = millis();
   
-  // Parse each field from the HTML text
-  // Format: "Bramble Bank Wind Speed 19.8 Knots Max Gust 20.6 Knots Wind Direction 335 Degree Tide Height .0 m Air Temp 17.4 C Pressure 997.4 mBar Visibility .0 nM Updated 29/08/2025 14:13:00"
-  
+  // Parse HTML table format
+  // New format: <td>Wind Speed</td><td>15.7 Knots</td>
   // Extract wind speed in knots
-  float windSpeedKnots = extractFloatAfterPhrase(htmlData, "Wind Speed ", " Knots");
+  float windSpeedKnots = extractFloatFromTableCell(htmlData, "Wind Speed");
   if (windSpeedKnots > 0) {
     data.windSpeed = windSpeedKnots * 0.514444; // Convert knots to m/s
     DEBUG_PRINTF("[DEBUG] Wind Speed: %.1f knots = %.1f m/s\n", windSpeedKnots, data.windSpeed);
@@ -417,7 +436,7 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   }
   
   // Extract wind gust in knots
-  float windGustKnots = extractFloatAfterPhrase(htmlData, "Max Gust ", " Knots");
+  float windGustKnots = extractFloatFromTableCell(htmlData, "Max Gust");
   if (windGustKnots > 0) {
     data.windGust = windGustKnots * 0.514444; // Convert knots to m/s
     DEBUG_PRINTF("[DEBUG] Wind Gust: %.1f knots = %.1f m/s\n", windGustKnots, data.windGust);
@@ -426,19 +445,19 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   }
   
   // Extract wind direction in degrees
-  data.windDirection = (int)extractFloatAfterPhrase(htmlData, "Wind Direction ", " Degree");
+  data.windDirection = (int)extractFloatFromTableCell(htmlData, "Wind Direction");
   DEBUG_PRINTF("[DEBUG] Wind Direction: %d degrees\n", data.windDirection);
   
   // Extract air temperature in Celsius
-  data.temperature = extractFloatAfterPhrase(htmlData, "Air Temp ", " C");
+  data.temperature = extractFloatFromTableCell(htmlData, "Air Temp");
   DEBUG_PRINTF("[DEBUG] Temperature: %.1f°C\n", data.temperature);
   
   // Extract pressure in mBar and convert to hPa (same value, different name)
-  data.pressure = extractFloatAfterPhrase(htmlData, "Pressure ", " mBar");
+  data.pressure = extractFloatFromTableCell(htmlData, "Pressure");
   DEBUG_PRINTF("[DEBUG] Pressure: %.1f mBar (%.1f hPa)\n", data.pressure, data.pressure);
   
-  // Extract timestamp
-  String timestamp = extractStringAfterPhrase(htmlData, "Updated ", "");
+  // Extract timestamp from HTML table format
+  String timestamp = extractStringFromTableCell(htmlData, "Updated");
   if (timestamp.length() > 0) {
     data.timestamp = timestamp;
     DEBUG_PRINTF("[DEBUG] Timestamp: %s\n", timestamp.c_str());
@@ -447,7 +466,7 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   }
   
   data.parseTime = millis() - parseStart;
-  data.isValid = true;
+  data.isValid = (data.windSpeed > 0 || data.windDirection > 0 || data.temperature > 0);
   
   // Store as last parsed data
   lastParsedData = data;
@@ -459,7 +478,7 @@ void parseBramblesData(String htmlData, unsigned long fetchTime) {
   Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
   Serial.printf("Air Temperature: %.1f°C\n", data.temperature);
   Serial.printf("Air Pressure: %.1f mBar\n", data.pressure);
-  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Last Updated: %s\n", ensureGMTTimestamp(data.timestamp).c_str());
   Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
   Serial.println("=============================");
 }
@@ -681,14 +700,18 @@ void fetchLymingtonWeather() {
   // Begin HTTPS request 
   http.begin(url);
   
-  // Set specific headers for WeatherFile.com
+  // Set specific headers for WeatherFile.com - discovered via browser dev tools
   http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
-  http.addHeader("Accept", "application/json,*/*");
+  http.addHeader("Accept", "*/*");
   http.addHeader("X-Requested-With", "XMLHttpRequest");
   http.addHeader("Referer", "https://weatherfile.com/location?loc_id=GBR00001&wt=KTS");
+  http.addHeader("Origin", "https://weatherfile.com");
+  http.addHeader("Content-Length", "0");
+  http.addHeader("wf-tkn", "PUBLIC"); // Key authentication header!
   
   unsigned long startTime = millis();
-  int httpCode = http.GET();
+  // Use POST request with empty body (as discovered in browser dev tools)
+  int httpCode = http.POST("");
   
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
@@ -742,10 +765,10 @@ void parseLymingtonData(String jsonData, unsigned long fetchTime) {
     return;
   }
   
-  // Parse weather parameters with priority for average values
+  // Parse weather parameters - data is already in m/s despite wt=KTS URL parameter
   // WeatherFile API provides various wind parameters:
-  // wdc = wind direction, wsc = wind speed, wgc = wind gust
-  // Look for average values first (more stable), then current/max
+  // wdc = wind direction, wsc = wind speed (m/s), wsc_avg = average wind speed
+  // wsc_max = max wind speed (use for gust)
   
   float windSpeedRaw = 0.0;
   float windGustRaw = 0.0;
@@ -763,19 +786,23 @@ void parseLymingtonData(String jsonData, unsigned long fetchTime) {
       DEBUG_PRINTF("[DEBUG] Wind Direction (%s): %d degrees\n", key.c_str(), data.windDirection);
     }
     
-    // Wind speed (prioritize average speed for stability)
-    if (key == "wsc_avg" || (key == "wsc" && windSpeedRaw == 0.0)) {
+    // Wind speed - use average for stability (data already in m/s)
+    if (key == "wsc_avg") {
       windSpeedRaw = value;
-      // WeatherFile uses knots based on URL parameter wt=KTS
-      data.windSpeed = windSpeedRaw * 0.514444; // Convert knots to m/s
-      DEBUG_PRINTF("[DEBUG] Wind Speed (%s): %.2f knots = %.2f m/s\n", key.c_str(), windSpeedRaw, data.windSpeed);
+      data.windSpeed = windSpeedRaw; // No conversion needed - already m/s
+      DEBUG_PRINTF("[DEBUG] Wind Speed (avg): %.2f m/s\n", data.windSpeed);
+    } else if (key == "wsc" && windSpeedRaw == 0.0) {
+      // Fallback to current wind speed if no average found
+      windSpeedRaw = value;
+      data.windSpeed = windSpeedRaw; // No conversion needed - already m/s
+      DEBUG_PRINTF("[DEBUG] Wind Speed (current): %.2f m/s\n", data.windSpeed);
     }
     
-    // Wind gust (look for max gust values)
-    if (key == "wgc_max" || key == "wgc" || (key.indexOf("gust") >= 0 && value > windGustRaw)) {
+    // Wind gust - use max wind speed as gust (data already in m/s)
+    if (key == "wsc_max") {
       windGustRaw = value;
-      data.windGust = windGustRaw * 0.514444; // Convert knots to m/s
-      DEBUG_PRINTF("[DEBUG] Wind Gust (%s): %.2f knots = %.2f m/s\n", key.c_str(), windGustRaw, data.windGust);
+      data.windGust = windGustRaw; // No conversion needed - already m/s
+      DEBUG_PRINTF("[DEBUG] Wind Gust (max): %.2f m/s\n", data.windGust);
     }
   }
   
@@ -810,9 +837,9 @@ void parseLymingtonData(String jsonData, unsigned long fetchTime) {
   
   // Display results
   Serial.println("\n=== LYMINGTON WEATHER STATION ===");
-  Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", windSpeedRaw, data.windSpeed);
+  Serial.printf("Wind Speed: %.1f m/s\n", data.windSpeed);
   if (windGustRaw > 0.0) {
-    Serial.printf("Wind Gust: %.1f knots (%.1f m/s)\n", windGustRaw, data.windGust);
+    Serial.printf("Wind Gust: %.1f m/s\n", data.windGust);
   }
   Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
   Serial.printf("Location: %s\n", data.location.c_str());
@@ -929,6 +956,90 @@ float knotsToMeterPerSecond(float knots) {
 // Convert m/s to knots
 float meterPerSecondToKnots(float mps) {
   return mps / 0.514444;
+}
+
+// Extract float value from HTML table cell format: <td>Label</td><td>Value Units</td>
+float extractFloatFromTableCell(String html, String label) {
+  // Find the label cell
+  String labelCell = "<td>" + label + "</td>";
+  int labelIndex = html.indexOf(labelCell);
+  if (labelIndex == -1) {
+    DEBUG_PRINTF("[DEBUG] Label '%s' not found in HTML table\n", label.c_str());
+    return 0.0;
+  }
+  
+  // Find the next <td> tag after the label (should contain the value)
+  int valueStart = html.indexOf("<td>", labelIndex + labelCell.length());
+  if (valueStart == -1) {
+    DEBUG_PRINTF("[DEBUG] Value cell not found after label '%s'\n", label.c_str());
+    return 0.0;
+  }
+  
+  int valueEnd = html.indexOf("</td>", valueStart);
+  if (valueEnd == -1) {
+    DEBUG_PRINTF("[DEBUG] Value cell end tag not found\n");
+    return 0.0;
+  }
+  
+  String valueCell = html.substring(valueStart + 4, valueEnd);
+  valueCell.trim();
+  
+  // Extract numeric value (first token before space)
+  int spaceIndex = valueCell.indexOf(' ');
+  String numberStr;
+  if (spaceIndex > 0) {
+    numberStr = valueCell.substring(0, spaceIndex);
+  } else {
+    numberStr = valueCell;
+  }
+  
+  DEBUG_PRINTF("[DEBUG] Extracted float for '%s': '%s' from cell '%s'\n", 
+               label.c_str(), numberStr.c_str(), valueCell.c_str());
+  
+  return numberStr.toFloat();
+}
+
+// Extract string value from HTML table cell format: <td>Label</td><td>String Value</td>
+String extractStringFromTableCell(String html, String label) {
+  // Find the label cell
+  String labelCell = "<td>" + label + "</td>";
+  int labelIndex = html.indexOf(labelCell);
+  if (labelIndex == -1) {
+    DEBUG_PRINTF("[DEBUG] Label '%s' not found in HTML table\n", label.c_str());
+    return "";
+  }
+  
+  // Find the next <td> tag after the label (should contain the value)
+  int valueStart = html.indexOf("<td>", labelIndex + labelCell.length());
+  if (valueStart == -1) {
+    DEBUG_PRINTF("[DEBUG] Value cell not found after label '%s'\n", label.c_str());
+    return "";
+  }
+  
+  int valueEnd = html.indexOf("</td>", valueStart);
+  if (valueEnd == -1) {
+    DEBUG_PRINTF("[DEBUG] Value cell end tag not found\n");
+    return "";
+  }
+  
+  String valueCell = html.substring(valueStart + 4, valueEnd);
+  valueCell.trim();
+  
+  // Check for embedded HTML (like the timestamp div)
+  int divStart = valueCell.indexOf("<div");
+  if (divStart != -1) {
+    int divContentStart = valueCell.indexOf(">", divStart);
+    int divEnd = valueCell.indexOf("</div>", divContentStart);
+    if (divContentStart != -1 && divEnd != -1) {
+      String divContent = valueCell.substring(divContentStart + 1, divEnd);
+      divContent.trim();
+      DEBUG_PRINTF("[DEBUG] Extracted string from div for '%s': '%s'\n", label.c_str(), divContent.c_str());
+      return divContent;
+    }
+  }
+  
+  DEBUG_PRINTF("[DEBUG] Extracted string for '%s': '%s'\n", label.c_str(), valueCell.c_str());
+  return valueCell;
 }
 
 // Get current UTC timestamp string
