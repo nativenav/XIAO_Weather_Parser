@@ -2,133 +2,151 @@
 
 # seaview.md
 
-## Seaview Weather Data Source - WeatherLink Integration
+## Seaview Weather Data Source - Navis Live Data Integration
 
 ### Overview
 
-**Seaview, Isle of Wight** weather station data accessed via WeatherLink's summaryData JSON API endpoint. Provides real-time wind conditions from a personal weather station located in Seaview.
+**Seaview, Isle of Wight** weather station data accessed via Navis Live Data API endpoint. Provides real-time wind conditions from a Navis WSD Sensor 15 located in Seaview.
 
 ### Data Source Details
 
 - **Station Location**: Seaview, Isle of Wight
-- **Station ID**: `0d117f9a7c7e425a8cc88e870f0e76fb`
-- **Data Format**: JSON (structured sensor data)
+- **Station Type**: Navis WSD Sensor 15 (Wind Speed/Direction)
+- **IMEI**: `083af23b9b89_15_1`
+- **Data Format**: Colon-delimited hex-encoded sensor data
 - **Update Frequency**: Real-time (every few minutes)
-- **Data Source**: WeatherLink personal weather station
+- **Data Source**: Navis live telemetry system
 
 
 ### Working Endpoint
 
+**Session URL (required first):**
 ```
-https://www.weatherlink.com/embeddablePage/summaryData/0d117f9a7c7e425a8cc88e870f0e76fb
+https://www.navis-livedata.com/view.php?u=36371
 ```
 
+**Live Data API URL:**
+```
+https://www.navis-livedata.com/query.php?imei=083af23b9b89_15_1&type=live
+```
+
+**Historical Data API URL (Enhanced):**
+```
+https://www.navis-livedata.com/query.php?imei=083af23b9b89_15_1&type=data&from={timestamp}&to={timestamp}
+```
 
 ### ESP32 HTTP Configuration
 
 ```cpp
-http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
-http.addHeader("Accept", "application/json,*/*");
-http.addHeader("X-Requested-With", "XMLHttpRequest");
-http.addHeader("Referer", "https://www.weatherlink.com/embeddablePage/show/0d117f9a7c7e425a8cc88e870f0e76fb/summary");
-```
+// First establish session
+session.get("https://www.navis-livedata.com/view.php?u=36371");
 
+// Then query API with session cookie
+http.addHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36");
+http.addHeader("Accept", "*/*");
+http.addHeader("Referer", "https://www.navis-livedata.com/view.php?u=36371");
+http.addHeader("Sec-Fetch-Dest", "empty");
+http.addHeader("Sec-Fetch-Mode", "cors");
+http.addHeader("Sec-Fetch-Site", "same-origin");
+```
 
 ### Data Structure
 
-**Current Conditions Array:**
-
-```json
-"currConditionValues": [
-  {
-    "sensorDataName": "Wind Speed",
-    "convertedValue": "6",
-    "unitLabel": "knots"
-  },
-  {
-    "sensorDataName": "Wind Direction", 
-    "convertedValue": "54",
-    "unitLabel": "°"
-  },
-  {
-    "sensorDataName": "10 Min High Wind Speed",
-    "convertedValue": "8", 
-    "unitLabel": "knots"
-  }
-]
+**Response Format (Colon-Delimited):**
+```
+272808525:0:23200377de0
 ```
 
-**Daily Extremes Array:**
+**Structure:**
+- `272808525` - Timestamp
+- `0` - Status flag (0 = OK)
+- `23200377de0` - Hex-encoded sensor data
 
-```json
-"highLowValues": [
-  {
-    "sensorDataName": "High Wind Speed",
-    "convertedValue": "20",
-    "unitLabel": "knots"
-  }
-]
+**Hex Data Decoding:**
+```cpp
+// Split hex into MSB and LSB
+MSB = int(hex_data[:-8], 16);     // All but last 8 chars
+LSB = int(hex_data[-8:], 16);     // Last 8 chars
+
+// Extract values using bit manipulation
+temp_raw = MSB & 0x7FF;           // bits 0-10 of MSB
+speed_raw = LSB >> 16;            // bits 16-31 of LSB  
+direction_raw = (LSB >> 7) & 0x1FF; // bits 7-15 of LSB (9 bits)
+rssi_raw = LSB & 0x7F;            // bits 0-6 of LSB
+
+// Apply conversions
+speed_ms = speed_raw / 10.0;       // Divide by 10 first
+speed_knots = speed_ms * 1.94384449; // Convert m/s to knots
+temp_celsius = (temp_raw - 400) / 10.0; // Temperature formula
 ```
 
 
 ### Available Wind Data
 
-- **Current Wind Speed** (knots)
-- **Wind Direction** (degrees)
-- **2 Min Average Wind Speed** (knots)
-- **10 Min Average Wind Speed** (knots)
-- **10 Min High Wind Speed** (gust data in knots)
-- **Daily High Wind Speed** (knots)
-- **Temperature** (when available)
+- **Average Wind Speed** (knots) - Calculated from recent historical data (1-minute window)
+- **Peak Wind Speed** (knots) - Maximum reading from recent historical data (gust)
+- **Wind Direction** (degrees) - Current direction
+- **Air Temperature** (Celsius) - When sensor reading is valid
+- **Signal Strength** (RSSI) - Sensor telemetry quality
 
+**Enhanced Implementation:** Now uses Navis historical data API (`type=data`) to calculate proper averages and peaks from recent readings, providing true wind speed vs gust differentiation like the website displays.
 
 ### Proven Test Results
 
-- Wind Speed: 6 knots
-- Wind Direction: 54°
-- 10 Min High (Gust): 8 knots
-- Daily High: 20 knots
-- Multiple time averages available
+- Wind Speed: 10.7 knots (5.5 m/s)
+- Wind Direction: 251°
+- Temperature: 16.2°C
+- Response Time: ~500ms (including session establishment)
+- Parse Time: ~5ms (hex decoding)
 
-
-### JSON Parsing Function
+### Hex Parsing Function
 
 ```cpp
-bool parseWeatherLinkData(const String& json, WeatherData& data) {
-  JsonDocument doc;
-  if (deserializeJson(doc, json)) return false;
+bool parseNavisData(const String& response, WeatherData& data) {
+  // Parse colon-delimited format: timestamp:status:hexdata
+  int firstColon = response.indexOf(':');
+  int secondColon = response.indexOf(':', firstColon + 1);
   
-  JsonObject obj = doc.is<JsonArray>() ? doc[0] : doc.as<JsonObject>();
-  JsonArray conditions = obj["currConditionValues"];
+  if (firstColon < 0 || secondColon < 0) return false;
   
-  for (JsonObject condition : conditions) {
-    String dataName = condition["sensorDataName"] | "";
-    String value = condition["convertedValue"] | "";
-    
-    if (value == "--" || value == "") continue;
-    
-    if (dataName == "Wind Speed") {
-      data.windSpeed = value.toFloat();
-    } else if (dataName == "Wind Direction") {
-      data.windDirection = value.toInt();
-    } else if (dataName.indexOf("High Wind Speed") >= 0) {
-      data.gustSpeed = max(data.gustSpeed, value.toFloat());
-    }
+  String hexData = response.substring(secondColon + 1);
+  if (hexData.length() < 8) return false;
+  
+  // Split hex into MSB and LSB
+  uint32_t MSB = 0, LSB = 0;
+  if (hexData.length() > 8) {
+    String msbHex = hexData.substring(0, hexData.length() - 8);
+    MSB = strtoul(msbHex.c_str(), NULL, 16);
   }
+  String lsbHex = hexData.substring(hexData.length() - 8);
+  LSB = strtoul(lsbHex.c_str(), NULL, 16);
+  
+  // Extract values using bit manipulation
+  uint16_t temp_raw = MSB & 0x7FF;          // bits 0-10 of MSB
+  uint16_t speed_raw = LSB >> 16;           // bits 16-31 of LSB
+  uint16_t direction_raw = (LSB >> 7) & 0x1FF; // bits 7-15 of LSB
+  uint8_t rssi_raw = LSB & 0x7F;            // bits 0-6 of LSB
+  
+  // Apply conversions
+  float speed_ms = speed_raw / 10.0;
+  data.windSpeed = speed_ms * 1.94384449;   // Convert to knots
+  data.windDirection = direction_raw;
+  data.temperature = (temp_raw - 400) / 10.0;
   
   return (data.windSpeed >= 0 && data.windDirection >= 0);
 }
 ```
 
-
 ### Discovery Method
 
-Found via browser Developer Tools by inspecting network requests on the WeatherLink embeddable page for this specific weather station.
+Found by analyzing the Navis Live Data website JavaScript and network requests. The hex decoding algorithm was reverse-engineered from the site's NetData2.js file.
 
 ### Integration Notes
 
+- Requires session management (cookie-based authentication)
 - Works reliably with ESP32C3 and HTTPS
-- Provides comprehensive wind data including averages and extremes
-- Complements Bramble Bank marine data for dual-station weather dashboard
-- JSON format easier to parse than HTML tables
+- Provides real-time instantaneous readings (no averaging)
+- Hex decoding is computationally lightweight
+- Complements Brambles Bank and Lymington averaged data
+- Most responsive of the three weather sources
 

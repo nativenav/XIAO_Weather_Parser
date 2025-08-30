@@ -46,6 +46,12 @@ unsigned long lastWiFiReconnectAttempt = 0;
 bool awaitingPasswordInput = false;
 int selectedNetworkIndex = -1;
 
+// Weather Station Refresh Management
+unsigned long lastBramblesRefresh = 0;
+unsigned long lastSeaviewRefresh = 0;
+unsigned long lastLymingtonRefresh = 0;
+const unsigned long WEATHER_REFRESH_INTERVAL = 120000; // 2 minutes in milliseconds
+
 // =============================================================================
 // SETUP FUNCTION
 // =============================================================================
@@ -489,21 +495,126 @@ void fetchSeaviewWeather() {
     return;
   }
   
-  Serial.println("[INFO] Fetching Seaview weather data...");
+  Serial.println("[INFO] Fetching Seaview historical weather data...");
+  
+  // Use historical data API with 1-minute window for averaged/peak calculations
+  time_t now = time(nullptr);
+  time_t fromTime = now - 60; // 1 minute ago for memory-efficient processing
+  time_t toTime = now;
+  
+  // Format timestamps for URL
+  char fromStr[32], toStr[32];
+  sprintf(fromStr, "%ld", fromTime);
+  sprintf(toStr, "%ld", toTime);
+  
+  String url = "https://www.navis-livedata.com/query.php?imei=083af23b9b89_15_1&type=data&from=" + String(fromStr) + "&to=" + String(toStr);
+  
+  DEBUG_PRINTF("[DEBUG] Fetching historical data from %s to %s\n", fromStr, toStr);
+  
+  // Retry logic for connection issues
+  int maxRetries = 3;
+  int retryDelay = 2000; // 2 seconds between retries
+  
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    // Begin HTTPS request 
+    http.begin(url);
+    
+    // Set specific headers for navis-livedata.com (session-based headers)
+    http.addHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+    http.addHeader("Accept", "*/*");
+    http.addHeader("Accept-Language", "en-GB,en;q=0.9,fr;q=0.8");
+    http.addHeader("Connection", "keep-alive");
+    http.addHeader("Referer", "https://www.navis-livedata.com/view.php?u=36371");
+    http.addHeader("Cookie", "PHPSESSID=temp_session"); // Basic session header
+    http.addHeader("Sec-Fetch-Dest", "empty");
+    http.addHeader("Sec-Fetch-Mode", "cors");
+    http.addHeader("Sec-Fetch-Site", "same-origin");
+    
+    unsigned long startTime = millis();
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      unsigned long fetchTime = millis() - startTime;
+      
+      DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+      DEBUG_PRINTF("[DEBUG] Raw historical response: %s\n", payload.c_str());
+      
+      // Check if we got an error response
+      if (payload == "error%" || payload.length() < 10) {
+        Serial.printf("[WARNING] Attempt %d/%d: Historical API returned error: %s\n", 
+                      attempt, maxRetries, payload.c_str());
+        
+        // Fallback to live data on final attempt
+        if (attempt == maxRetries) {
+          Serial.println("[INFO] Falling back to live data API...");
+          fetchSeaviewLiveData();
+          http.end();
+          return;
+        }
+        
+        http.end();
+        if (attempt < maxRetries) {
+          Serial.printf("[INFO] Retrying historical API in %d seconds...\n", retryDelay / 1000);
+          delay(retryDelay);
+          retryDelay *= 1.5; // Exponential backoff
+          continue;
+        }
+      } else {
+        // Parse the Seaview historical weather data
+        parseSeaviewHistoricalData(payload, fetchTime);
+        http.end();
+        return; // Success - exit retry loop
+      }
+      
+    } else {
+      Serial.printf("[ERROR] Attempt %d/%d failed. HTTP %d: %s\n", 
+                    attempt, maxRetries, httpCode, http.errorToString(httpCode).c_str());
+      
+      http.end();
+      
+      // Fallback to live data on final attempt
+      if (attempt == maxRetries) {
+        Serial.println("[INFO] Falling back to live data API...");
+        fetchSeaviewLiveData();
+        return;
+      }
+      
+      // If connection refused (-1) or timeout, retry after delay
+      if ((httpCode == -1 || httpCode == -11) && attempt < maxRetries) {
+        Serial.printf("[INFO] Retrying historical API in %d seconds...\n", retryDelay / 1000);
+        delay(retryDelay);
+        retryDelay *= 1.5; // Exponential backoff
+      } else {
+        // Final failure or non-retryable error
+        break;
+      }
+    }
+  }
+  
+  Serial.println("[ERROR] Failed to fetch Seaview historical data, trying live fallback...");
+  fetchSeaviewLiveData();
+}
+
+// Fallback function for live data (original implementation)
+void fetchSeaviewLiveData() {
+  Serial.println("[INFO] Fetching Seaview live data (fallback)...");
+  
+  String url = "https://www.navis-livedata.com/query.php?imei=083af23b9b89_15_1&type=live";
   
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT);
   
-  String url = "https://www.weatherlink.com/embeddablePage/summaryData/0d117f9a7c7e425a8cc88e870f0e76fb";
-  
   // Begin HTTPS request 
   http.begin(url);
   
-  // Set specific headers for WeatherLink
-  http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
-  http.addHeader("Accept", "application/json,*/*");
-  http.addHeader("X-Requested-With", "XMLHttpRequest");
-  http.addHeader("Referer", "https://www.weatherlink.com/embeddablePage/show/0d117f9a7c7e425a8cc88e870f0e76fb/summary");
+  // Set headers for live data
+  http.addHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36");
+  http.addHeader("Accept", "*/*");
+  http.addHeader("Referer", "https://www.navis-livedata.com/view.php?u=36371");
   
   unsigned long startTime = millis();
   int httpCode = http.GET();
@@ -512,18 +623,170 @@ void fetchSeaviewWeather() {
     String payload = http.getString();
     unsigned long fetchTime = millis() - startTime;
     
-    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
-    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    DEBUG_PRINTF("[DEBUG] Live data received %d bytes in %lu ms\n", payload.length(), fetchTime);
     
-    // Parse the Seaview weather data
-    parseSeaviewData(payload, fetchTime);
-    
+    if (payload != "error%" && payload.length() >= 10) {
+      // Parse as live data (hex format)
+      parseSeaviewLiveData(payload, fetchTime);
+    } else {
+      Serial.printf("[ERROR] Live data API also failed: %s\n", payload.c_str());
+    }
   } else {
-    Serial.printf("[ERROR] Failed to fetch Seaview data. HTTP %d: %s\n", 
-                  httpCode, http.errorToString(httpCode).c_str());
+    Serial.printf("[ERROR] Live data fetch failed. HTTP %d\n", httpCode);
   }
   
   http.end();
+}
+
+// Parse Seaview historical data (hex format)
+void parseSeaviewHistoricalData(String hexData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Seaview historical weather data...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Seaview, Isle of Wight";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse hex data - expect colon-separated hex strings
+  // Format: "timestamp1:hexdata1,timestamp2:hexdata2,..."
+  
+  // Memory-efficient processing: use small arrays for wind speed collection
+  const int MAX_SAMPLES = 20; // Limit for ESP32 memory constraints
+  float windSpeeds[MAX_SAMPLES];
+  int windDirections[MAX_SAMPLES];
+  int sampleCount = 0;
+  
+  // Split by comma to get individual readings
+  int lastIndex = 0;
+  int commaIndex = hexData.indexOf(',', lastIndex);
+  
+  while ((commaIndex != -1 || lastIndex < hexData.length()) && sampleCount < MAX_SAMPLES) {
+    String reading;
+    if (commaIndex != -1) {
+      reading = hexData.substring(lastIndex, commaIndex);
+      lastIndex = commaIndex + 1;
+      commaIndex = hexData.indexOf(',', lastIndex);
+    } else {
+      reading = hexData.substring(lastIndex);
+      lastIndex = hexData.length();
+    }
+    
+    // Parse individual reading: "timestamp:hexdata"
+    int colonIndex = reading.indexOf(':');
+    if (colonIndex != -1 && colonIndex < reading.length() - 1) {
+      String timestamp = reading.substring(0, colonIndex);
+      String hexValue = reading.substring(colonIndex + 1);
+      
+      DEBUG_PRINTF("[DEBUG] Processing sample %d: time=%s, hex=%s\n", 
+                   sampleCount, timestamp.c_str(), hexValue.c_str());
+      
+      // Extract wind data from hex
+      if (hexValue.length() >= 8) {
+        windSpeeds[sampleCount] = extractWindSpeedFromHex(hexValue);
+        windDirections[sampleCount] = extractWindDirectionFromHex(hexValue);
+        sampleCount++;
+      }
+    }
+  }
+  
+  if (sampleCount > 0) {
+    // Calculate statistics
+    float avgSpeed, peakSpeed;
+    calculateWindStats(windSpeeds, sampleCount, &avgSpeed, &peakSpeed);
+    
+    // Convert from knots to m/s
+    data.windSpeed = avgSpeed * 0.514444;
+    data.windGust = peakSpeed * 0.514444;
+    
+    // Calculate average direction (simple average - could be improved with circular statistics)
+    int totalDirection = 0;
+    for (int i = 0; i < sampleCount; i++) {
+      totalDirection += windDirections[i];
+    }
+    data.windDirection = totalDirection / sampleCount;
+    
+    data.timestamp = "Historical average (1 min)";
+    
+    DEBUG_PRINTF("[DEBUG] Calculated from %d samples: avg=%.1f kts, peak=%.1f kts, dir=%d°\n", 
+                 sampleCount, avgSpeed, peakSpeed, data.windDirection);
+  } else {
+    Serial.println("[ERROR] No valid samples found in historical data");
+    data.isValid = false;
+  }
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = (sampleCount > 0 && (data.windSpeed > 0 || data.windDirection > 0));
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== SEAVIEW WEATHER STATION (Historical) ===");
+  if (data.isValid) {
+    Serial.printf("Wind Speed (avg): %.1f knots (%.1f m/s)\n", meterPerSecondToKnots(data.windSpeed), data.windSpeed);
+    Serial.printf("Wind Gust (peak): %.1f knots (%.1f m/s)\n", meterPerSecondToKnots(data.windGust), data.windGust);
+    Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+    Serial.printf("Samples processed: %d\n", sampleCount);
+  } else {
+    Serial.println("No valid data available");
+  }
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("===========================================");
+}
+
+// Parse Seaview live data (hex format) - fallback function
+void parseSeaviewLiveData(String hexData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Seaview live weather data (fallback)...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Seaview, Isle of Wight";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse single hex reading - expect 8 hex characters
+  String cleanHex = hexData;
+  cleanHex.trim();
+  
+  if (cleanHex.length() >= 8) {
+    // Extract wind speed and direction
+    float windSpeedKnots = extractWindSpeedFromHex(cleanHex);
+    int windDirection = extractWindDirectionFromHex(cleanHex);
+    
+    data.windSpeed = windSpeedKnots * 0.514444; // Convert knots to m/s
+    data.windGust = data.windSpeed; // Live data: gust = current speed (instantaneous)
+    data.windDirection = windDirection;
+    data.timestamp = "Live instantaneous data";
+    
+    DEBUG_PRINTF("[DEBUG] Live data: speed=%.1f kts, dir=%d°\n", windSpeedKnots, windDirection);
+  } else {
+    Serial.printf("[ERROR] Invalid hex data format: %s\n", cleanHex.c_str());
+    data.isValid = false;
+  }
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = (data.windSpeed >= 0 || data.windDirection >= 0);
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== SEAVIEW WEATHER STATION (Live) ===");
+  if (data.isValid) {
+    Serial.printf("Wind Speed: %.1f knots (%.1f m/s)\n", meterPerSecondToKnots(data.windSpeed), data.windSpeed);
+    Serial.printf("Wind Gust: %.1f knots (%.1f m/s)\n", meterPerSecondToKnots(data.windGust), data.windGust);
+    Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+    Serial.println("Note: Live data - gust equals current speed");
+  } else {
+    Serial.println("No valid data available");
+  }
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("=======================================");
 }
 
 void parseSeaviewData(String jsonData, unsigned long fetchTime) {
@@ -690,7 +953,77 @@ void fetchLymingtonWeather() {
     return;
   }
   
-  Serial.println("[INFO] Fetching Lymington weather data...");
+  Serial.println("[INFO] Fetching Lymington enhanced weather data...");
+  
+  // Use the enhanced infowindow endpoint for proper averaged and gust data
+  String url = "https://lymingtonharbour.sofarocean.com/infowindow.ggl";
+  
+  // Retry logic for connection issues
+  int maxRetries = 3;
+  int retryDelay = 2000; // 2 seconds between retries
+  
+  for (int attempt = 1; attempt <= maxRetries; attempt++) {
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT);
+    
+    // Begin HTTPS request 
+    http.begin(url);
+    
+    // Set specific headers for Lymington Harbor Sofar Ocean endpoint
+    http.addHeader("User-Agent", "Mozilla/5.0 (compatible; WeatherStation/1.0)");
+    http.addHeader("Accept", "*/*");
+    http.addHeader("Accept-Language", "en-GB,en;q=0.9");
+    http.addHeader("Referer", "https://lymingtonharbour.sofarocean.com/");
+    http.addHeader("Origin", "https://lymingtonharbour.sofarocean.com");
+    http.addHeader("Connection", "keep-alive");
+    
+    unsigned long startTime = millis();
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      unsigned long fetchTime = millis() - startTime;
+      
+      DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
+      DEBUG_PRINTF("[DEBUG] Raw enhanced response: %s\n", payload.c_str());
+      
+      // Parse the enhanced Lymington weather data
+      parseLymingtonEnhancedData(payload, fetchTime);
+      http.end();
+      return; // Success - exit retry loop
+      
+    } else {
+      Serial.printf("[ERROR] Attempt %d/%d failed. HTTP %d: %s\n", 
+                    attempt, maxRetries, httpCode, http.errorToString(httpCode).c_str());
+      
+      http.end();
+      
+      // Fallback to basic API on final attempt
+      if (attempt == maxRetries) {
+        Serial.println("[INFO] Falling back to basic WeatherFile API...");
+        fetchLymingtonBasicWeather();
+        return;
+      }
+      
+      // If connection refused (-1) or timeout, retry after delay
+      if ((httpCode == -1 || httpCode == -11) && attempt < maxRetries) {
+        Serial.printf("[INFO] Retrying enhanced API in %d seconds...\n", retryDelay / 1000);
+        delay(retryDelay);
+        retryDelay *= 1.5; // Exponential backoff
+      } else {
+        // Final failure or non-retryable error
+        break;
+      }
+    }
+  }
+  
+  Serial.println("[ERROR] Failed to fetch enhanced Lymington data, trying basic fallback...");
+  fetchLymingtonBasicWeather();
+}
+
+// Fallback function for basic WeatherFile data (original implementation)
+void fetchLymingtonBasicWeather() {
+  Serial.println("[INFO] Fetching Lymington basic data (fallback)...");
   
   HTTPClient http;
   http.setTimeout(HTTP_TIMEOUT);
@@ -717,18 +1050,112 @@ void fetchLymingtonWeather() {
     String payload = http.getString();
     unsigned long fetchTime = millis() - startTime;
     
-    DEBUG_PRINTF("[DEBUG] Received %d bytes in %lu ms\n", payload.length(), fetchTime);
-    DEBUG_PRINTF("[DEBUG] Raw response: %s\n", payload.c_str());
+    DEBUG_PRINTF("[DEBUG] Basic data received %d bytes in %lu ms\n", payload.length(), fetchTime);
     
-    // Parse the Lymington weather data
+    // Parse the basic Lymington weather data
     parseLymingtonData(payload, fetchTime);
     
   } else {
-    Serial.printf("[ERROR] Failed to fetch Lymington data. HTTP %d: %s\n", 
+    Serial.printf("[ERROR] Basic WeatherFile API also failed. HTTP %d: %s\n", 
                   httpCode, http.errorToString(httpCode).c_str());
   }
   
   http.end();
+}
+
+// Parse Lymington enhanced data from Sofar Ocean endpoint
+void parseLymingtonEnhancedData(String jsonData, unsigned long fetchTime) {
+  Serial.println("\n[INFO] Parsing Lymington enhanced weather data...");
+  
+  // Initialize weather data
+  WeatherData data;
+  initializeWeatherData(&data);
+  data.location = "Lymington Harbor (Enhanced)";
+  
+  unsigned long parseStart = millis();
+  
+  // Parse JSON using ArduinoJson library
+  DynamicJsonDocument doc(JSON_BUFFER_SIZE);
+  DeserializationError error = deserializeJson(doc, jsonData);
+  
+  if (error) {
+    Serial.printf("[ERROR] Enhanced JSON parsing failed: %s\n", error.c_str());
+    return;
+  }
+  
+  // Extract wind data from enhanced endpoint structure
+  // Expected format: {"wsa": avg_wind_speed, "wsh": high_wind_speed, "wsl": low_wind_speed, "wdc": direction, ...}
+  
+  float windSpeedAvg = 0.0; // Average wind speed (use as primary)
+  float windSpeedHigh = 0.0; // High wind speed (use as gust)
+  float windDirection = 0.0;
+  
+  // Parse wind speed average (wsa)
+  if (doc.containsKey("wsa")) {
+    windSpeedAvg = doc["wsa"] | 0.0;
+    data.windSpeed = windSpeedAvg * 0.514444; // Convert knots to m/s
+    DEBUG_PRINTF("[DEBUG] Wind Speed Avg (wsa): %.1f knots = %.1f m/s\n", windSpeedAvg, data.windSpeed);
+  }
+  
+  // Parse wind speed high (wsh) as gust
+  if (doc.containsKey("wsh")) {
+    windSpeedHigh = doc["wsh"] | 0.0;
+    data.windGust = windSpeedHigh * 0.514444; // Convert knots to m/s
+    DEBUG_PRINTF("[DEBUG] Wind Speed High (wsh): %.1f knots = %.1f m/s\n", windSpeedHigh, data.windGust);
+  }
+  
+  // Parse wind direction (wdc)
+  if (doc.containsKey("wdc")) {
+    windDirection = doc["wdc"] | 0.0;
+    data.windDirection = (int)windDirection;
+    DEBUG_PRINTF("[DEBUG] Wind Direction (wdc): %.0f degrees\n", windDirection);
+  }
+  
+  // Parse additional parameters if available
+  if (doc.containsKey("at")) {
+    data.temperature = doc["at"] | 0.0;
+    DEBUG_PRINTF("[DEBUG] Air Temperature: %.1f°C\n", data.temperature);
+  }
+  
+  if (doc.containsKey("bp")) {
+    data.pressure = doc["bp"] | 0.0;
+    DEBUG_PRINTF("[DEBUG] Barometric Pressure: %.1f hPa\n", data.pressure);
+  }
+  
+  // Extract timestamp if available
+  if (doc.containsKey("timestamp")) {
+    data.timestamp = doc["timestamp"] | "Enhanced data";
+  } else {
+    data.timestamp = "Enhanced live data";
+  }
+  
+  data.parseTime = millis() - parseStart;
+  data.isValid = (data.windSpeed >= 0.0 || data.windDirection >= 0);
+  
+  // Store as last parsed data
+  lastParsedData = data;
+  
+  // Display results
+  Serial.println("\n=== LYMINGTON WEATHER STATION (Enhanced) ===");
+  if (data.isValid) {
+    Serial.printf("Wind Speed (avg): %.1f knots (%.1f m/s)\n", windSpeedAvg, data.windSpeed);
+    if (windSpeedHigh > 0.0) {
+      Serial.printf("Wind Gust (high): %.1f knots (%.1f m/s)\n", windSpeedHigh, data.windGust);
+    }
+    Serial.printf("Wind Direction: %d degrees\n", data.windDirection);
+    if (data.temperature > 0.0) {
+      Serial.printf("Air Temperature: %.1f°C\n", data.temperature);
+    }
+    if (data.pressure > 0.0) {
+      Serial.printf("Barometric Pressure: %.1f hPa\n", data.pressure);
+    }
+  } else {
+    Serial.println("No valid data available");
+  }
+  Serial.printf("Location: %s\n", data.location.c_str());
+  Serial.printf("Last Updated: %s\n", data.timestamp.c_str());
+  Serial.printf("Fetch Time: %lu ms, Parse Time: %lu ms\n", fetchTime, data.parseTime);
+  Serial.println("=============================================");
 }
 
 void parseLymingtonData(String jsonData, unsigned long fetchTime) {
@@ -1065,6 +1492,86 @@ String ensureGMTTimestamp(String timestamp) {
   }
   
   return timestamp;
+}
+
+// =============================================================================
+// HEX DATA PARSING UTILITY FUNCTIONS (for Seaview historical data)
+// =============================================================================
+
+// Parse hex string to integer value
+unsigned long parseHexString(String hexStr) {
+  unsigned long result = 0;
+  for (int i = 0; i < hexStr.length(); i++) {
+    char c = hexStr.charAt(i);
+    result <<= 4;
+    if (c >= '0' && c <= '9') {
+      result += c - '0';
+    } else if (c >= 'A' && c <= 'F') {
+      result += c - 'A' + 10;
+    } else if (c >= 'a' && c <= 'f') {
+      result += c - 'a' + 10;
+    }
+  }
+  return result;
+}
+
+// Extract wind speed from Navis hex data (bits 16-31)
+float extractWindSpeedFromHex(String hexData) {
+  if (hexData.length() < 8) return 0.0;
+  
+  // Extract the wind speed portion (bits 16-31) - middle 4 hex digits
+  String windSpeedHex = hexData.substring(2, 6);
+  unsigned long rawValue = parseHexString(windSpeedHex);
+  
+  // Convert to knots (scaling factor from Navis documentation)
+  float knots = rawValue * 0.01;
+  
+  DEBUG_PRINTF("[DEBUG] Wind speed hex: %s, raw: %lu, knots: %.2f\n", 
+               windSpeedHex.c_str(), rawValue, knots);
+  
+  return knots;
+}
+
+// Extract wind direction from Navis hex data (bits 0-15)
+int extractWindDirectionFromHex(String hexData) {
+  if (hexData.length() < 8) return 0;
+  
+  // Extract the wind direction portion (bits 0-15) - last 4 hex digits
+  String windDirHex = hexData.substring(4, 8);
+  unsigned long rawValue = parseHexString(windDirHex);
+  
+  // Convert to degrees (scaling factor from Navis documentation)
+  int degrees = (int)(rawValue * 0.1) % 360;
+  
+  DEBUG_PRINTF("[DEBUG] Wind direction hex: %s, raw: %lu, degrees: %d\n", 
+               windDirHex.c_str(), rawValue, degrees);
+  
+  return degrees;
+}
+
+// Calculate statistics from array of wind speed values
+void calculateWindStats(float* speeds, int count, float* avgSpeed, float* peakSpeed) {
+  if (count == 0) {
+    *avgSpeed = 0.0;
+    *peakSpeed = 0.0;
+    return;
+  }
+  
+  float sum = 0.0;
+  float max = 0.0;
+  
+  for (int i = 0; i < count; i++) {
+    sum += speeds[i];
+    if (speeds[i] > max) {
+      max = speeds[i];
+    }
+  }
+  
+  *avgSpeed = sum / count;
+  *peakSpeed = max;
+  
+  DEBUG_PRINTF("[DEBUG] Wind stats from %d samples: avg=%.2f, peak=%.2f\n", 
+               count, *avgSpeed, *peakSpeed);
 }
 
 // =============================================================================

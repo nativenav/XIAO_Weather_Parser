@@ -127,14 +127,32 @@ bool extractTableValue(const String& html, const String& fieldName, String& resu
 
 Found via browser Developer Tools by inspecting network requests on the Southampton VTS Tides \& Weather page. The AJAX endpoint was identified in the XHR requests that populate the weather data tables.
 
+### Usage Example
+
+```
+> brambles
+[INFO] Fetching Brambles Bank weather data...
+
+=== BRAMBLES BANK WEATHER STATION ===
+Wind Speed: 9.3 knots (4.8 m/s)
+Wind Gust: 9.7 knots (5.0 m/s)
+Wind Direction: 7 degrees
+Air Temperature: 16.9°C
+Air Pressure: 1002.2 mBar
+Last Updated: 29/08/2025 22:46:00 GMT
+Fetch Time: 180 ms, Parse Time: 8 ms
+====================================
+```
+
 ### Integration Notes
 
-- Works reliably with ESP32C3 and HTTPS
-- Professional marine weather data from ABP Southampton
-- HTML table parsing required (more complex than JSON)
-- Provides comprehensive marine conditions including pressure and tide data
-- Ideal for sailing and marine applications in the Solent area
-- Complements Seaview personal weather station data for comprehensive coverage
+- ✅ Works reliably with ESP32C3 and HTTPS
+- ✅ Professional marine weather data from ABP Southampton
+- ✅ HTML table parsing (more complex than JSON but stable)
+- ✅ Provides comprehensive marine conditions including pressure and temperature
+- ✅ Separate wind speed and gust measurements (averaged data)
+- ✅ Ideal for sailing and marine applications in the Solent area
+- ✅ Complements Seaview (instantaneous) and Lymington (averaged) data sources
 
 
 ### Station Significance
